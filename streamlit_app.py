@@ -313,9 +313,11 @@ def render_window(target_audio, sr, donor_library, target_notes, window_start, w
     return rendered, placements
 
 
-def equal_power_crossfade_splice(base, patch, start_s, end_s, sr, fade_s=0.05):
+def equal_power_crossfade_splice(base, patch, start_s, sr, fade_s=0.05):
     fade_n = int(fade_s * sr)
-    start_n, end_n = int(start_s * sr), int(end_s * sr)
+    start_n = int(start_s * sr)
+    end_n = start_n + len(patch)  # derive from patch's actual length, not a second independent
+                                   # int(end_s * sr) rounding -- the two can disagree by 1 sample
     t = np.linspace(0, np.pi / 2, fade_n)
     fade_out, fade_in = np.cos(t), np.sin(t)
     out = base.copy()
@@ -409,7 +411,7 @@ def run_pipeline(input_path, clean_reference_path, out_dir):
     with st.status("Step 3b — Crossfade splice + re-verification", expanded=True) as status:
         st.write("Splices the rendered segment into the stem with an equal-power crossfade, then reruns the detector to confirm risk actually dropped.")
         t0 = time.time()
-        final_stem = equal_power_crossfade_splice(target_audio, rendered_window, region[0], region[1], sr_t)
+        final_stem = equal_power_crossfade_splice(target_audio, rendered_window, region[0], sr_t)
         final_stem_path = out_dir / "final_stem.wav"
         sf.write(final_stem_path, final_stem, sr_t)
         result["final_stem"], result["final_stem_path"] = final_stem, final_stem_path
