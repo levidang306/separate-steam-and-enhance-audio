@@ -1,16 +1,4 @@
-"""Enhanced Stem Workflow -- interactive demo.
 
-Upload an audio file, choose whether to synthetically degrade it (or use it as-is), click Run,
-and watch each pipeline step (per docs/enhanced-stem-workflow.docx) execute with its result
-shown immediately: stem separation (BS-RoFormer), MIDI transcription (MuScriptor), audio/harmony
-analysis, degradation detection, AMT MIDI repair, concatenative render, crossfade blend.
-
-Heavy models run on GPU if available, else CPU -- a ~60-90s clip takes roughly 10-20 minutes
-end to end on CPU (BS-RoFormer alone is the majority of that). Progress is shown per step so
-it's clear what's happening.
-
-Run with: streamlit run streamlit_app.py
-"""
 import shutil
 import time
 from pathlib import Path
