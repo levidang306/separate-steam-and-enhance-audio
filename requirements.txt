@@ -1,0 +1,35 @@
+# Suno stem restoration -- direct dependencies.
+#
+# torch/torchaudio are pinned to the cu118 build. The installed NVIDIA driver
+# (512.72) exposes CUDA 11.6, and cu118 is the newest PyTorch CUDA build it can
+# run; plain `pip install torch` resolves to a CPU-only wheel, which silently
+# drops every step onto the CPU and makes them roughly an order of magnitude
+# slower. Install these two from the PyTorch index:
+#
+#   pip install torch==2.7.1+cu118 torchaudio==2.7.1+cu118 \
+#       --index-url https://download.pytorch.org/whl/cu118
+#
+torch==2.7.1+cu118
+torchaudio==2.7.1+cu118
+
+# Step 1 -- beat tracking
+beat-this==1.1.0
+
+# Step 2 -- denoise (Mel-Roformer-Denoise). Needs FFmpeg on PATH:
+#   winget install Gyan.FFmpeg
+audio-separator==0.44.5
+onnxruntime==1.28.0
+
+# Step 3 -- Apollo. No pip package; clone the repo and let suno_restore import
+# look2hear from it:
+#   git clone https://github.com/JusperLee/Apollo vendor/Apollo
+# omegaconf is required to unpickle its published checkpoint.
+omegaconf==2.3.1
+
+# Audio handling and UI
+librosa==0.11.0
+matplotlib==3.11.1
+numpy==2.4.6
+soundfile==0.14.0
+soxr==1.1.0
+streamlit==1.61.1
