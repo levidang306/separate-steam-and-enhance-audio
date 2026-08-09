@@ -120,3 +120,18 @@ watchdog==6.0.0
 wcwidth==0.8.2
 websockets==16.1.1
 wheel==0.47.0
+
+# ---------------------------------------------------------------------------
+# Stage A -- midi_repair (ported from rewrite-v2 / requirements-enhanced-stem.txt):
+# stem separation, MIDI transcription, degradation detection, AMT infilling,
+# donor re-render. Verified with `pip install --dry-run` against everything
+# above (this file already has huggingface_hub==1.27.0, transformers==5.14.1,
+# torch==2.7.1+cu118, ml_collections==1.1.0 -- no changes needed there) --
+# zero resolver conflicts.
+# ---------------------------------------------------------------------------
+bs-roformer-infer==0.1.5
+muscriptor==0.3.0
+mido==1.3.3
+music21==10.5.0
+dtw-python==1.7.5
+anticipation @ git+https://github.com/jthickstun/anticipation@af37397922665a0fb8d474d7988b0f3755a38d45
