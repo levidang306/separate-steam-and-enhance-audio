@@ -25,20 +25,34 @@ def _spectrum_db(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def spectral_cliff_hz(
-    audio: np.ndarray, sr: int, min_drop_db: float = 25.0, window_hz: float = 1500.0
+    audio: np.ndarray,
+    sr: int,
+    min_drop_db: float = 25.0,
+    window_hz: float = 1500.0,
+    floor_hz: float = 2000.0,
 ) -> float | None:
     """Highest frequency where the spectrum falls `min_drop_db` within `window_hz`.
 
     A codec or generator cutoff appears as a cliff. Measuring level relative to
     the spectral peak instead would just report tonal balance -- it reads a bass
     stem as "cut at 400Hz" purely because bass has no treble to begin with.
+
+    `floor_hz` is where the search starts, and it is a real limit rather than a
+    formality: a cutoff *below* it cannot be found at all, because by the time
+    the search begins the signal is already at the noise floor and there is no
+    further drop left to detect. A file low-passed at 1500Hz reads as having no
+    cliff whatsoever under the 2000Hz default, despite falling 73dB between
+    1400Hz and 1800Hz. Callers that can tolerate the false positives this guards
+    against -- a bass stem's natural rolloff -- should lower it and lean on the
+    corroborating evidence instead (energy below the cliff, and whether a model's
+    output is actually derived from the source).
     """
     freqs, spec_db = _spectrum_db(audio, sr)
     bin_hz = freqs[1] - freqs[0]
     window = max(1, int(window_hz / bin_hz))
     cliff = None
     for i in range(len(spec_db) - window):
-        if freqs[i] < 2000:  # below this it is musical content, not a codec cliff
+        if freqs[i] < floor_hz:
             continue
         if spec_db[i] - spec_db[i + window] >= min_drop_db:
             cliff = float(freqs[i])

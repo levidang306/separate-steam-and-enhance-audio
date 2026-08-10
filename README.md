@@ -11,46 +11,29 @@ Restores stems exported by Suno. Three defects, one step each:
 Stems in, restored stems out — same set of stems, same channel count, same sample rate, still
 aligned with each other.
 
-**No step runs unless it can show it should.** An enhancement chain that runs unconditionally will
-make good audio worse, and it does so silently: on a solo guitar this one warped the timing by
-375ms, expanded the quiet frames down by 15.75dB, took 3.4dB out of the 5–10kHz band where pick
-attack lives, and folded the stereo image to mono — while reporting success. So every step now has
-to make its case first, against measurements, before it is allowed to touch anything:
+Every enabled step runs unconditionally and at full strength:
 
 ```
-INPUT ─► ANALYSIS ─► DAMAGE DETECTION ─► STEP DECISION
-      ─► SELECTIVE RESTORATION ─► WET/DRY BLEND
-      ─► QUALITY VERIFICATION ─► ACCEPT or DRY ─► OUTPUT
+INPUT -> TEMPO -> DENOISE -> BANDWIDTH -> OUTPUT
 ```
 
-| Module | Question it answers |
-|---|---|
-| [`quality.py`](suno_restore/quality.py) | What actually changed? Timing, bands, transients, dynamics, stereo, artifacts |
-| [`gate.py`](suno_restore/gate.py) | Should this step run on this material at all? |
-| [`damage.py`](suno_restore/damage.py) | Where is the damage, in time and frequency? |
-| [`blend.py`](suno_restore/blend.py) | How much of the model's output survives, and where? |
-| [`verify.py`](suno_restore/verify.py) | Is the result safe, and is it actually better? |
-| [`chain.py`](suno_restore/chain.py) | All of the above, in order, with the dry signal held as fallback |
+There is no decision layer and no safety net. A step that is ticked runs, its
+output replaces the signal, and the result is written whatever it measures like.
+That is a deliberate choice, and it is worth knowing what it costs: this exact
+configuration warped a solo guitar by 375ms, expanded its quiet frames down by
+15.75dB, took 3.4dB out of the 5-10kHz band carrying pick attack, and folded the
+stereo image to mono -- while reporting success.
 
-The dry signal is kept from start to finish and is never written over, so any step that turns out
-to have made things worse can be undone. A stem that fails verification is replaced by its input
-and reported as `is_enhanced=false` with the reason recorded — never as a successful enhancement.
-
-Configuration lives in [`.env.example`](.env.example); every default is the cautious one.
-
-## Checking it
+So check the result rather than assuming it. [`quality.py`](suno_restore/quality.py)
+measures what a run actually did -- timing drift, per-band level, transients,
+dynamics, stereo, artifacts -- and `scripts/ab_quality.py` prints it:
 
 ```bash
-.venv/Scripts/python scripts/ab_quality.py original.wav processed.wav   # objective A/B
-.venv/Scripts/python scripts/quality_gate.py                            # the CI gate
-.venv/Scripts/python scripts/ablation.py                                # per-step matrix
-.venv/Scripts/python scripts/benchmark.py                               # before/after
+.venv/Scripts/python scripts/ab_quality.py original.wav restored.wav
 ```
 
-`scripts/quality_gate.py` is what CI runs. It fails if clean input is modified, if the reference
-guitar regresses, or if any combination of steps damages clean material — and it runs against
-stand-in models that reproduce the *measured misbehaviour* of the real ones, so passing means the
-architecture holds even when what it is given is as bad as what was originally observed.
+An output identical to its input means the step did nothing. An output whose
+2-second correlation has collapsed means it did far too much.
 
 ## Setup
 
@@ -91,19 +74,23 @@ report = restore(
 ## Reading the output
 
 Every step reports what it did rather than asserting it worked, because on real material not all
-three defects show up — and a skip is a result, not a failure:
+three defects show up:
 
-- **Tempo** — usually skipped, and says why. It only helps material with a real, steady, percussive
-  pulse, and is off by default. Where it does run: how many inter-beat segments were corrected and
-  by how much.
-- **Denoise** — the level of what was removed, relative to the stem, and the confidence it was
-  removed at. Below about -40dB means the stem was already clean and the step changed nothing.
-- **Bandwidth** — whether a real cutoff was found, and where. No cliff means no restoration:
-  generating a high band for material that never had one is invention, not repair.
+- **Tempo** — how many inter-beat segments were stretched and by how much. Watch the length change:
+  the step warps only what falls inside the detected beat grid and copies the rest, so on material
+  where the grid is thin the uncorrected regions inherit the drift instead of losing it.
+- **Denoise** — the level of what was removed, relative to the stem. Below about -40dB means the
+  stem was already clean and the step changed nothing audible.
+- **Bandwidth** — where the spectral cliff sat before and after.
 
-`report.stems[name].engine_config` carries the whole record — every decision, the measurements
-behind it, and the verification verdict — so a run can be explained after the fact rather than
-guessed at.
+None of these says whether the result is *better*. For that, measure it:
+
+```bash
+.venv/Scripts/python scripts/ab_quality.py original.wav restored.wav
+```
+
+The numbers to read first are 2-second correlation (below ~0.9 means the timing or spectrum has
+been disturbed), timing drift, and the per-band deltas.
 
 ## Notes
 
