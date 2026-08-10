@@ -24,14 +24,10 @@ from pathlib import Path
 from typing import Callable
 
 import librosa
-import mido
 import numpy as np
-import soundfile as sf
 import torch
-import yaml
-from dtw import dtw
-from ml_collections import ConfigDict
-from music21 import converter as m21_converter
+
+from suno_restore.audio_io import load_audio, resample
 
 SR = 22050
 HOP_LENGTH = 512
@@ -50,10 +46,12 @@ def _device(device: str | None) -> torch.device:
 
 @lru_cache(maxsize=1)
 def _load_bs_roformer(device: str):
+    import yaml
     from bs_roformer.download import ensure_model_assets
     from bs_roformer.inference import SafeLoaderWithTuple
     from bs_roformer.model_registry import DEFAULT_MODEL
     from bs_roformer.utils import get_model_from_config
+    from ml_collections import ConfigDict
 
     model_path, config_path = ensure_model_assets(DEFAULT_MODEL)
     with open(config_path) as f:
@@ -112,10 +110,13 @@ def _col_normalize(m):
 
 
 def _separate_stems(input_path, out_dir: Path, device: str) -> dict:
+    import soundfile as sf
     from bs_roformer.utils import demix_track
 
     model, config = _load_bs_roformer(device)
-    mix, sr = sf.read(input_path)
+    # Decode through the same ffmpeg path as V3. libsndfile can silently
+    # truncate the low-bitrate VBR MP3 files this project is built for.
+    mix, sr = load_audio(input_path, target_sr=None)
     mono = mix.ndim == 1
     mix_stereo = np.stack([mix, mix], axis=-1) if mono else mix
     mixture = torch.tensor(mix_stereo.T, dtype=torch.float32)
@@ -137,12 +138,16 @@ def _separate_stems(input_path, out_dir: Path, device: str) -> dict:
     recon = sum(stem_result[name] for name in stem_names).T
     recon_error = _rms(recon - mix_stereo) / _rms(mix_stereo)
     return {
-        "stem_paths": stem_paths, "stem_rms": stem_rms, "target_stem": target_stem,
+        "stem_paths": stem_paths,
+        "stem_rms": stem_rms,
+        "target_stem": target_stem,
         "recon_error": recon_error,
     }
 
 
 def _transcribe(input_path, out_dir: Path, device: str) -> dict:
+    import mido
+
     muscriptor_model = _load_muscriptor(device)
     midi_bytes = muscriptor_model.transcribe_to_midi(str(input_path))
     midi_path = out_dir / "transcription.mid"
@@ -154,7 +159,10 @@ def _transcribe(input_path, out_dir: Path, device: str) -> dict:
 
 
 def _analyze(input_path, midi_path) -> dict:
-    y_mono, sr_mono = librosa.load(input_path, sr=SR, mono=True)
+    from dtw import dtw
+    from music21 import converter as m21_converter
+
+    y_mono, sr_mono = load_audio(input_path, target_sr=SR, mono=True)
     chroma = librosa.feature.chroma_cqt(y=y_mono, sr=sr_mono, hop_length=HOP_LENGTH)
 
     score = m21_converter.parse(Path(midi_path))
@@ -164,7 +172,7 @@ def _analyze(input_path, midi_path) -> dict:
     midi_chroma = np.zeros((12, max(n_beats, 1)))
     for n in score.flatten().notes:
         beat_idx = min(int(n.offset), n_beats - 1)
-        for p in (n.pitches if hasattr(n, "pitches") else [n.pitch]):
+        for p in n.pitches if hasattr(n, "pitches") else [n.pitch]:
             midi_chroma[p.pitchClass, beat_idx] += 1
 
     alignment = dtw(_col_normalize(chroma).T, _col_normalize(midi_chroma).T, keep_internals=True)
@@ -176,7 +184,7 @@ def _analyze(input_path, midi_path) -> dict:
 
 def compute_degradation_risk(audio_path_or_array, sr: int = SR, hop_length: int = HOP_LENGTH):
     if isinstance(audio_path_or_array, (str, Path)):
-        y, _ = librosa.load(audio_path_or_array, sr=sr, mono=True)
+        y, _ = load_audio(audio_path_or_array, target_sr=sr, mono=True)
     else:
         y = audio_path_or_array
 
@@ -189,7 +197,9 @@ def compute_degradation_risk(audio_path_or_array, sr: int = SR, hop_length: int 
     return frame_times, flatness_risk
 
 
-def detect_flagged_region(risk, frame_times, z=1.5, min_duration=1.0, pad=0.25, merge_gap=1.0, min_risk=0.4):
+def detect_flagged_region(
+    risk, frame_times, z=1.5, min_duration=1.0, pad=0.25, merge_gap=1.0, min_risk=0.4
+):
     threshold = max(risk.mean() + z * risk.std(), min_risk)
     above = risk > threshold
     frame_dt = frame_times[1] - frame_times[0] if len(frame_times) > 1 else 0.0
@@ -229,8 +239,14 @@ def decode_notes(events):
     notes = []
     for t, d, note in zip(events[0::3], events[1::3], events[2::3]):
         note_id = note - NOTE_OFFSET
-        notes.append({"onset": t / TIME_RESOLUTION, "dur": (d - DUR_OFFSET) / TIME_RESOLUTION,
-                      "pitch": note_id % 128, "instrument": note_id // 128})
+        notes.append(
+            {
+                "onset": t / TIME_RESOLUTION,
+                "dur": (d - DUR_OFFSET) / TIME_RESOLUTION,
+                "pitch": note_id % 128,
+                "instrument": note_id // 128,
+            }
+        )
     return notes
 
 
@@ -244,7 +260,9 @@ def _repair_midi(midi_path, region_start: float, region_end: float, device: str)
     before = ops.clip(events, 0, region_start, clip_duration=False)
     after = ops.clip(events, region_end, max_t, clip_duration=False)
     context = ops.sort(before + after)
-    repaired_events = ops.sort(sample.generate(amt_model, region_start, region_end, inputs=context, top_p=0.95))
+    repaired_events = ops.sort(
+        sample.generate(amt_model, region_start, region_end, inputs=context, top_p=0.95)
+    )
     return repaired_events, events
 
 
@@ -291,11 +309,11 @@ def equal_power_crossfade_splice(base, patch, start_s, sr, fade_s=0.05):
     t = np.linspace(0, np.pi / 2, fade_n)
     fade_out, fade_in = np.cos(t), np.sin(t)
     out = base.copy()
-    a_seg, b_seg = base[start_n:start_n + fade_n], patch[:fade_n]
-    out[start_n:start_n + fade_n] = a_seg * fade_out[:len(a_seg)] + b_seg * fade_in[:len(a_seg)]
-    out[start_n + fade_n:end_n - fade_n] = patch[fade_n:len(patch) - fade_n]
-    a_seg, b_seg = patch[len(patch) - fade_n:], base[end_n - fade_n:end_n]
-    out[end_n - fade_n:end_n] = a_seg * fade_out[:len(a_seg)] + b_seg * fade_in[:len(a_seg)]
+    a_seg, b_seg = base[start_n : start_n + fade_n], patch[:fade_n]
+    out[start_n : start_n + fade_n] = a_seg * fade_out[: len(a_seg)] + b_seg * fade_in[: len(a_seg)]
+    out[start_n + fade_n : end_n - fade_n] = patch[fade_n : len(patch) - fade_n]
+    a_seg, b_seg = patch[len(patch) - fade_n :], base[end_n - fade_n : end_n]
+    out[end_n - fade_n : end_n] = a_seg * fade_out[: len(a_seg)] + b_seg * fade_in[: len(a_seg)]
     return out
 
 
@@ -306,8 +324,45 @@ class EnhanceReport:
     risk_in_before: float | None = None
     risk_in_after: float | None = None
     final_audio: np.ndarray | None = None
-    final_sr: int = SR
+    final_sr: int = 0
+    is_enhanced: bool = False
+    output_path: Path | None = None
     notes: list[str] = field(default_factory=list)
+
+
+def preserve_source_layout(
+    source_audio: np.ndarray,
+    source_sr: int,
+    analysis_audio: np.ndarray,
+    repaired_audio: np.ndarray,
+    analysis_sr: int,
+) -> np.ndarray:
+    """Apply V2's mono repair delta without replacing the source representation.
+
+    V2 analyzes and renders at 22.05kHz mono, while V3 deliberately preserves the
+    uploaded file's native sample rate and channel layout. Passing V2's render
+    directly into V3 would therefore discard stereo and real high-frequency content
+    before V3 could verify either. Applying only the repair delta to every source
+    channel keeps the original stereo difference intact and leaves all untouched
+    samples sourced from the original decode.
+    """
+    if analysis_audio.ndim != 1 or repaired_audio.ndim != 1:
+        raise ValueError("V2 repair layout conversion expects mono analysis audio")
+    if analysis_audio.shape != repaired_audio.shape:
+        raise ValueError("V2 analysis and repaired audio must have the same shape")
+
+    delta = (repaired_audio - analysis_audio).astype(np.float32)
+    native_delta = resample(delta, analysis_sr, source_sr)
+    fitted_delta = np.zeros(source_audio.shape[0], dtype=np.float32)
+    sample_count = min(len(native_delta), len(fitted_delta))
+    fitted_delta[:sample_count] = native_delta[:sample_count]
+
+    restored = source_audio.astype(np.float32, copy=True)
+    if restored.ndim == 1:
+        restored += fitted_delta
+    else:
+        restored += fitted_delta[:, None]
+    return np.clip(restored, -1.0, 1.0).astype(np.float32)
 
 
 def enhance(
@@ -324,6 +379,7 @@ def enhance(
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     report = EnhanceReport()
+    source_audio, source_sr = load_audio(input_path, target_sr=None)
 
     progress("Stage A / 1a - stem separation (BS-RoFormer)")
     sep = _separate_stems(input_path, work_dir, device)
@@ -341,10 +397,10 @@ def enhance(
     region, threshold = detect_flagged_region(risk, frame_times)
     report.region = region
 
-    target_audio, sr_t = librosa.load(input_path, sr=SR, mono=True)
+    target_audio, sr_t = load_audio(input_path, target_sr=SR, mono=True)
     if region is None:
         report.notes.append("no region cleared the risk threshold -- passed through unchanged")
-        report.final_audio, report.final_sr = target_audio, sr_t
+        report.final_audio, report.final_sr = source_audio, source_sr
         return report
 
     progress(f"Stage A / 2b - MIDI repair for [{region[0]:.2f}s, {region[1]:.2f}s)")
@@ -356,10 +412,14 @@ def enhance(
     donor_library = [n for n in orig_notes if not (region[0] <= n["onset"] < region[1])]
     target_notes = [n for n in repaired_notes if region[0] <= n["onset"] < region[1]]
     if not donor_library:
-        report.notes.append("no donor notes available outside the flagged region -- passed through unchanged")
-        report.final_audio, report.final_sr = target_audio, sr_t
+        report.notes.append(
+            "no donor notes available outside the flagged region -- passed through unchanged"
+        )
+        report.final_audio, report.final_sr = source_audio, source_sr
         return report
-    rendered_window, _placements = render_window(target_audio, sr_t, donor_library, target_notes, region[0], region[1])
+    rendered_window, _placements = render_window(
+        target_audio, sr_t, donor_library, target_notes, region[0], region[1]
+    )
 
     progress("Stage A / 3b - crossfade splice + re-verify")
     final_stem = equal_power_crossfade_splice(target_audio, rendered_window, region[0], sr_t)
@@ -370,5 +430,24 @@ def enhance(
     report.risk_in_before = float(risk[mask].mean()) if mask.any() else None
     report.risk_in_after = float(risk_after[mask_after].mean()) if mask_after.any() else None
 
-    report.final_audio, report.final_sr = final_stem, sr_t
+    if (
+        report.risk_in_before is None
+        or report.risk_in_after is None
+        or report.risk_in_after >= report.risk_in_before
+    ):
+        report.notes.append(
+            "candidate repair did not lower measured risk -- passed through unchanged"
+        )
+        report.final_audio, report.final_sr = source_audio, source_sr
+        return report
+
+    report.final_audio = preserve_source_layout(
+        source_audio,
+        source_sr,
+        target_audio,
+        final_stem,
+        sr_t,
+    )
+    report.final_sr = source_sr
+    report.is_enhanced = True
     return report

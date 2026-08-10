@@ -1,57 +1,37 @@
-"""Merged restoration pipeline: midi_repair (Stage A) -> suno_restore (Stage B).
+"""Combined Version 2 -> Version 3 audio restoration pipeline.
 
-Stage A (midi_repair, ported from rewrite-v2) assumes the input stem may have
-one localized damaged span, finds it, and repairs only that span by
-regenerating MIDI and re-rendering from real donor audio elsewhere in the
-same stem. If nothing is flagged, Stage A is a no-op pass-through.
-
-Stage B (suno_restore, this branch's own design) assumes three defects are
-present across the whole stem regardless of Stage A's outcome -- tempo drift,
-hiss/crackle, and bandwidth loss -- and corrects all three unconditionally.
-
-Order matters for one concrete reason: Stage A's risk detector
-(spectral flatness) is calibrated on the *input* signal. Running Stage B
-first would denoise and bandwidth-extend the stem before Stage A ever sees
-it, changing the flatness profile the detector was calibrated against.
-Stage A therefore always runs first, on the rawest signal available.
-
-Stage A works internally at 22050Hz (a rewrite-v2 constant, unchanged here).
-Stage B requires 48kHz throughout -- its tempo/denoise/bandwidth models and
-its own cross-stem sync guarantee are built around that rate. The handoff
-resamples Stage A's output up to `suno_restore.TARGET_SR` before Stage B ever
-sees it; skipping this step would feed Stage B a signal already missing
-everything above ~10kHz (half of 22050), which bandwidth extension cannot
-distinguish from a genuinely narrow-band stem.
-
-GPU memory: Stage A's models (BS-RoFormer, MuScriptor, the AMT model) and
-Stage B's models (beat_this, the denoiser, Apollo) are each individually
-sized to fit an 8GB card, but were never tested resident at the same time.
-`midi_repair.unload_models()` runs between stages so only one stage's models
-occupy VRAM at once.
+Version 2 (`midi_repair`) detects and repairs one localized damaged span.
+Version 3 (`suno_restore`) then measures tempo, noise, and bandwidth damage,
+runs only justified steps, blends conservatively, and verifies or rolls back
+the result. Both outputs are durable artifacts so callers can compare them.
 """
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import midi_repair
 import suno_restore
-from suno_restore.audio_io import TARGET_SR, resample, save_audio
+from suno_restore.audio_io import load_audio, save_audio
 from suno_restore.pipeline import RunReport
 
 
 @dataclass
 class CombinedReport:
+    input_path: Path
     stage_a: midi_repair.EnhanceReport | None
     stage_b: RunReport
+    version_2_path: Path | None
+    version_3_path: Path
 
 
 def restore_from_stem(
     input_path: str | Path,
     output_dir: str | Path,
-    apollo_repo: str | Path,
+    apollo_repo: str | Path | None,
     device: str | None = None,
     work_dir: str | Path | None = None,
     do_stage_a: bool = True,
@@ -62,54 +42,96 @@ def restore_from_stem(
     on_tempo: Callable[[object], None] = lambda analysis: None,
     on_stem: Callable[[object], None] = lambda entry: None,
 ) -> CombinedReport:
-    """Run the full merged pipeline on one input stem.
+    """Run V2 then enhanced V3 on one file and retain both version outputs.
 
-    `input_path` is a single audio file -- a stem exported by Suno, or one of
-    V1's 9 separated stems. `output_dir` receives Stage B's final output
-    (`<name>_restored.wav`, 48kHz). `do_stage_a=False` skips straight to Stage
-    B on the raw input, at its native sample rate resampled to 48kHz --
-    useful when the input has no localized damage to speak of and only the
-    three whole-track defects need correcting.
+    Outputs are written to `<output_dir>/v2/<name>_v2.wav` and
+    `<output_dir>/v3/<name>_restored.wav`. The V2 handoff keeps the original
+    sample rate and channel layout; V3 therefore receives the same signal
+    representation it is expected to preserve and verify.
     """
     input_path = Path(input_path)
     output_dir = Path(output_dir)
     work_dir = Path(work_dir) if work_dir else output_dir / "_work"
-    stage_a_dir = work_dir / "stage_a"
-    stage_b_input_dir = work_dir / "stage_b_input"
+    version_2_dir = output_dir / "v2"
+    version_3_dir = output_dir / "v3"
+    stage_a_dir = work_dir / "v2"
+    stage_b_input_dir = work_dir / "v3_input"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    version_2_dir.mkdir(parents=True, exist_ok=True)
+    version_3_dir.mkdir(parents=True, exist_ok=True)
     stage_a_dir.mkdir(parents=True, exist_ok=True)
+    if stage_b_input_dir.exists():
+        shutil.rmtree(stage_b_input_dir)
     stage_b_input_dir.mkdir(parents=True, exist_ok=True)
 
     stage_a_report = None
+    version_2_path = None
     if do_stage_a:
-        progress("Stage A - localized MIDI repair")
-        stage_a_report = midi_repair.enhance(input_path, stage_a_dir, device=device, progress=progress)
+        progress("Version 2 - localized MIDI repair")
+        try:
+            stage_a_report = midi_repair.enhance(
+                input_path,
+                stage_a_dir,
+                device=device,
+                progress=progress,
+            )
+        finally:
+            progress("Releasing Version 2 models before Version 3 loads")
+            midi_repair.unload_models()
 
-        progress("Releasing Stage A models before Stage B loads")
-        midi_repair.unload_models()
-
-        progress(f"Resampling Stage A output {stage_a_report.final_sr}Hz -> {TARGET_SR}Hz")
-        resampled = resample(stage_a_report.final_audio, stage_a_report.final_sr, TARGET_SR)
-        save_audio(stage_b_input_dir / f"{input_path.stem}.wav", resampled, TARGET_SR)
+        if stage_a_report.final_audio is None or not stage_a_report.final_sr:
+            raise RuntimeError("Version 2 completed without producing audio")
+        version_2_path = save_audio(
+            version_2_dir / f"{input_path.stem}_v2.wav",
+            stage_a_report.final_audio,
+            stage_a_report.final_sr,
+        )
+        stage_a_report.output_path = version_2_path
+        handoff_audio, handoff_sr = stage_a_report.final_audio, stage_a_report.final_sr
     else:
-        progress("Stage A skipped - loading raw input for Stage B")
-        from suno_restore.audio_io import load_audio
+        progress("Version 2 skipped - sending the native upload to Version 3")
+        handoff_audio, handoff_sr = load_audio(input_path, target_sr=None)
 
-        audio, sr = load_audio(input_path, target_sr=TARGET_SR)
-        save_audio(stage_b_input_dir / f"{input_path.stem}.wav", audio, sr)
+    staged_input = save_audio(
+        stage_b_input_dir / f"{input_path.stem}.wav",
+        handoff_audio,
+        handoff_sr,
+    )
+    progress(
+        f"Version 3 input: {staged_input.name} at {handoff_sr}Hz "
+        f"with {'1 channel' if handoff_audio.ndim == 1 else f'{handoff_audio.shape[1]} channels'}"
+    )
 
-    progress("Stage B - whole-track tempo/denoise/bandwidth correction")
+    progress("Version 3 - gated, blended, and verified restoration")
     stage_b_report = suno_restore.restore(
         stage_b_input_dir,
-        output_dir,
+        version_3_dir,
         do_tempo=do_tempo,
         do_denoise=do_denoise,
         do_bandwidth=do_bandwidth,
         apollo_repo=apollo_repo,
         device=device or "cpu",
-        work_dir=work_dir,
+        work_dir=work_dir / "v3",
         progress=progress,
         on_tempo=on_tempo,
         on_stem=on_stem,
     )
 
-    return CombinedReport(stage_a=stage_a_report, stage_b=stage_b_report)
+    version_3_paths = [
+        entry.output_path
+        for entry in stage_b_report.stems.values()
+        if entry.output_path is not None
+    ]
+    if len(version_3_paths) != 1:
+        raise RuntimeError(
+            f"Version 3 should produce exactly one file, produced {len(version_3_paths)}"
+        )
+
+    return CombinedReport(
+        input_path=input_path,
+        stage_a=stage_a_report,
+        stage_b=stage_b_report,
+        version_2_path=version_2_path,
+        version_3_path=version_3_paths[0],
+    )

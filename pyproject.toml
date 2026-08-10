@@ -1,0 +1,23 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Third-party checkouts, not ours to reformat. Apollo in particular is pinned to
+# an upstream revision, and reflowing it would make every future pull a conflict.
+exclude = ["vendor", ".venv", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# The long lines here are rows of a markdown table rendered in the UI. Wrapping
+# them would put line breaks inside table cells, which changes what the reader
+# sees; the limit exists for code, and this is prose.
+"streamlit_app.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    # librosa/numba emit deprecation noise on numpy 2.x that we do not control.
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]

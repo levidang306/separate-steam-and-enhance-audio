@@ -1,11 +1,11 @@
-"""Stage A of the merged restoration pipeline: localized MIDI-based repair.
+"""Version 2 of the merged restoration pipeline: localized MIDI-based repair.
 
-Ported from the rewrite-v2 Streamlit prototype (streamlit_app.py) with the
-Streamlit calls stripped out. Ported, not rewritten -- the model choices and
-thresholds are unchanged; see docs/design/2026-08-10-merged-pipeline.md for
-why this stage still exists next to suno_restore's whole-track pipeline.
+The model choices and detection thresholds come from the rewrite-v2
+Streamlit prototype. The renewed merge adds reliable ffmpeg decoding,
+native-rate/channel output, and a risk-based rollback; see
+docs/design/2026-08-10-merged-pipeline.md.
 """
 
-from .repair import EnhanceReport, enhance, unload_models
+from .repair import EnhanceReport, enhance, preserve_source_layout, unload_models
 
-__all__ = ["EnhanceReport", "enhance", "unload_models"]
+__all__ = ["EnhanceReport", "enhance", "preserve_source_layout", "unload_models"]

@@ -8,7 +8,49 @@ Restores stems exported by Suno. Three defects, one step each:
 | 2 | Hiss / crackle | Mel-Roformer-Denoise, via [audio-separator](https://github.com/nomadkaraoke/python-audio-separator) |
 | 3 | Bandwidth loss | [Apollo](https://github.com/JusperLee/Apollo) |
 
-Stems in, restored stems out — same set of stems, all at 48kHz, still aligned with each other.
+Stems in, restored stems out — same set of stems, same channel count, same sample rate, still
+aligned with each other.
+
+**No step runs unless it can show it should.** An enhancement chain that runs unconditionally will
+make good audio worse, and it does so silently: on a solo guitar this one warped the timing by
+375ms, expanded the quiet frames down by 15.75dB, took 3.4dB out of the 5–10kHz band where pick
+attack lives, and folded the stereo image to mono — while reporting success. So every step now has
+to make its case first, against measurements, before it is allowed to touch anything:
+
+```
+INPUT ─► ANALYSIS ─► DAMAGE DETECTION ─► STEP DECISION
+      ─► SELECTIVE RESTORATION ─► WET/DRY BLEND
+      ─► QUALITY VERIFICATION ─► ACCEPT or DRY ─► OUTPUT
+```
+
+| Module | Question it answers |
+|---|---|
+| [`quality.py`](suno_restore/quality.py) | What actually changed? Timing, bands, transients, dynamics, stereo, artifacts |
+| [`gate.py`](suno_restore/gate.py) | Should this step run on this material at all? |
+| [`damage.py`](suno_restore/damage.py) | Where is the damage, in time and frequency? |
+| [`blend.py`](suno_restore/blend.py) | How much of the model's output survives, and where? |
+| [`verify.py`](suno_restore/verify.py) | Is the result safe, and is it actually better? |
+| [`chain.py`](suno_restore/chain.py) | All of the above, in order, with the dry signal held as fallback |
+
+The dry signal is kept from start to finish and is never written over, so any step that turns out
+to have made things worse can be undone. A stem that fails verification is replaced by its input
+and reported as `is_enhanced=false` with the reason recorded — never as a successful enhancement.
+
+Configuration lives in [`.env.example`](.env.example); every default is the cautious one.
+
+## Checking it
+
+```bash
+.venv/Scripts/python scripts/ab_quality.py original.wav processed.wav   # objective A/B
+.venv/Scripts/python scripts/quality_gate.py                            # the CI gate
+.venv/Scripts/python scripts/ablation.py                                # per-step matrix
+.venv/Scripts/python scripts/benchmark.py                               # before/after
+```
+
+`scripts/quality_gate.py` is what CI runs. It fails if clean input is modified, if the reference
+guitar regresses, or if any combination of steps damages clean material — and it runs against
+stand-in models that reproduce the *measured misbehaviour* of the real ones, so passing means the
+architecture holds even when what it is given is as bad as what was originally observed.
 
 ## Setup
 
@@ -27,11 +69,34 @@ every step onto the CPU — denoising one stem goes from under a minute to well 
 
 ## Usage
 
+### Combined Version 2 + Version 3
+
+```bash
+.venv/Scripts/streamlit run merged_app.py
+```
+
+Upload one file and run the combined flow. Version 2 performs localized MIDI repair first;
+enhanced Version 3 then evaluates, selectively restores, blends, and verifies that result. The UI
+shows separate audio players and plots for the original, Version 2, and Version 3 outputs.
+
+Artifacts are deliberately separate:
+
+```text
+data/interim/restored_merged/
+├── v2/<name>_v2.wav
+└── v3/<name>_restored.wav
+```
+
+From Python, `full_pipeline.restore_from_stem(...)` returns a `CombinedReport` with
+`version_2_path`, `version_3_path`, and the detailed reports from both versions.
+
+### Version 3 only
+
 ```bash
 .venv/Scripts/streamlit run streamlit_app.py
 ```
 
-Point it at a folder of stems, choose which steps to run, and read what each reports.
+Upload one audio file, choose which steps to run, and read what each reports.
 
 Or from Python:
 
@@ -49,14 +114,19 @@ report = restore(
 ## Reading the output
 
 Every step reports what it did rather than asserting it worked, because on real material not all
-three defects show up:
+three defects show up — and a skip is a result, not a failure:
 
-- **Tempo** — how many inter-beat segments were corrected and by how much. On the reference track:
-  68.2 BPM, median correction 1.7%, total length change under 0.25%.
-- **Denoise** — the level of what was removed, relative to the stem. Below about -40dB means the
-  stem was already clean and the step changed nothing audible.
-- **Bandwidth** — where the spectral cliff sat before and after. On the reference track cutoffs
-  moved from 12.5-18.6kHz up to roughly 21.7kHz.
+- **Tempo** — usually skipped, and says why. It only helps material with a real, steady, percussive
+  pulse, and is off by default. Where it does run: how many inter-beat segments were corrected and
+  by how much.
+- **Denoise** — the level of what was removed, relative to the stem, and the confidence it was
+  removed at. Below about -40dB means the stem was already clean and the step changed nothing.
+- **Bandwidth** — whether a real cutoff was found, and where. No cliff means no restoration:
+  generating a high band for material that never had one is invention, not repair.
+
+`report.stems[name].engine_config` carries the whole record — every decision, the measurements
+behind it, and the verification verdict — so a run can be explained after the fact rather than
+guessed at.
 
 ## Notes
 

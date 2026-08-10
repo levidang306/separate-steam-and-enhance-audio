@@ -73,7 +73,9 @@ def residual_level_db(original: np.ndarray, cleaned: np.ndarray) -> float:
     return rms_db(residual) - rms_db(to_mono(original[:n]))
 
 
-def tempo_stability(beat_times: np.ndarray, target_interval_s: float | None = None) -> dict[str, float]:
+def tempo_stability(
+    beat_times: np.ndarray, target_interval_s: float | None = None
+) -> dict[str, float]:
     """Summarise how steady a beat sequence is, in BPM.
 
     Gaps are divided by the number of beats they span before being converted to
