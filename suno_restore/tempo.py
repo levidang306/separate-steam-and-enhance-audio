@@ -122,7 +122,9 @@ def analyse(audio: np.ndarray, sr: int, reference_stem: str, device: str = "cpu"
     )
 
 
-def _segment_bounds(analysis: TempoAnalysis, n_samples: int, sr: int) -> list[tuple[int, int, float]]:
+def _segment_bounds(
+    analysis: TempoAnalysis, n_samples: int, sr: int
+) -> list[tuple[int, int, float]]:
     """Split the timeline into (start, end, stretch_rate) segments.
 
     Rate follows librosa's convention: >1 shortens a segment, <1 lengthens it.

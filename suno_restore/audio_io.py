@@ -74,13 +74,22 @@ def probe(path: str | Path) -> tuple[int, int]:
 
 
 def load_audio(
-    path: str | Path, target_sr: int | None = TARGET_SR, mono: bool = False
+    path: str | Path,
+    target_sr: int | None = TARGET_SR,
+    mono: bool = False,
+    channels: int | None = None,
 ) -> tuple[np.ndarray, int]:
-    """Decode audio to float32 with shape (samples,) or (samples, channels)."""
+    """Decode audio to float32 with shape (samples,) or (samples, channels).
+
+    `channels` forces the layout regardless of what the file holds. Callers use
+    it when the file's own channel count must not be allowed to decide the
+    result -- reading a model's output, for instance, where a mono file would
+    otherwise silently turn a stereo stem into a mono one.
+    """
     ffmpeg, _ = _binaries()
-    source_sr, channels = probe(path)
+    source_sr, file_channels = probe(path)
     sr = target_sr or source_sr
-    out_channels = 1 if mono else channels
+    out_channels = channels if channels else (1 if mono else file_channels)
 
     result = subprocess.run(
         [
@@ -115,6 +124,47 @@ def resample(audio: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
 
 def to_mono(audio: np.ndarray) -> np.ndarray:
     return audio if audio.ndim == 1 else audio.mean(axis=1)
+
+
+def channel_count(audio: np.ndarray) -> int:
+    return 1 if audio.ndim == 1 else int(audio.shape[1])
+
+
+def to_mid_side(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Split stereo into mid and side, both mono.
+
+    This is the escape hatch for a model that only emits mono. Feeding it the
+    downmix and calling the result stereo throws away the side channel
+    outright; feeding it mid and side separately keeps the stereo image, at the
+    cost of a second pass.
+    """
+    if audio.ndim != 2 or audio.shape[1] != 2:
+        raise ValueError(f"mid/side needs 2 channels, got shape {audio.shape}")
+    left, right = audio[:, 0], audio[:, 1]
+    return (left + right) / 2.0, (left - right) / 2.0
+
+
+def from_mid_side(mid: np.ndarray, side: np.ndarray) -> np.ndarray:
+    """Inverse of `to_mid_side`, exact up to float rounding."""
+    n = min(len(mid), len(side))
+    mid, side = mid[:n], side[:n]
+    return np.stack([mid + side, mid - side], axis=1).astype(np.float32)
+
+
+def match_channels(audio: np.ndarray, channels: int) -> np.ndarray:
+    """Force a channel layout, duplicating or downmixing as needed.
+
+    A last resort. It keeps the *count* correct but cannot recreate side
+    information that a stage already discarded, so callers should prefer
+    mid/side processing and use this only to satisfy a hard contract.
+    """
+    current = channel_count(audio)
+    if current == channels:
+        return audio
+    if channels == 1:
+        return to_mono(audio)
+    mono = to_mono(audio)
+    return np.repeat(mono[:, None], channels, axis=1).astype(np.float32)
 
 
 def is_effectively_silent(audio: np.ndarray, peak_threshold_db: float = -45.0) -> bool:

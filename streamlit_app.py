@@ -19,16 +19,15 @@ import numpy as np
 import streamlit as st
 import torch
 
-from suno_restore import bandwidth, denoise, pipeline, tempo
+from suno_restore import bandwidth, pipeline, tempo
 from suno_restore.audio_io import (
-    FFmpegNotFound,
     TARGET_SR,
+    FFmpegNotFound,
     is_effectively_silent,
     load_audio,
 )
 from suno_restore.metrics import energy_above_hz, spectral_cliff_hz
 
-DEFAULT_INPUT = Path("data/input/Another Heartbreak Stems")
 DEFAULT_OUTPUT = Path("data/interim/restored")
 DEFAULT_APOLLO = Path("vendor/Apollo")
 UPLOAD_DIR = Path("data/interim/uploaded")
@@ -37,7 +36,7 @@ st.set_page_config(page_title="Suno Stem Restoration", layout="wide")
 st.title("Suno Stem Restoration")
 st.caption(
     "Tempo correction (Beat This!) → denoise (Mel-Roformer-Denoise) → bandwidth "
-    "extension (Apollo). Stems in, restored stems out."
+    "extension (Apollo). One audio file in, one restored file out."
 )
 
 
@@ -149,9 +148,9 @@ with st.sidebar:
     uploaded = st.file_uploader(
         "Upload an audio file",
         type=["wav", "mp3", "flac", "aiff", "aif", "ogg", "m4a"],
-        help="Restores this one file. Leave empty to use the folder below instead.",
+        accept_multiple_files=False,
+        help="Upload one audio file to restore.",
     )
-    input_dir = Path(st.text_input("…or a stem folder", str(DEFAULT_INPUT)))
     output_dir = Path(st.text_input("Output folder", str(DEFAULT_OUTPUT)))
 
     if uploaded is not None:
@@ -160,9 +159,10 @@ with st.sidebar:
         upload_dir = Path(UPLOAD_DIR)
         shutil.rmtree(upload_dir, ignore_errors=True)
         upload_dir.mkdir(parents=True, exist_ok=True)
-        (upload_dir / uploaded.name).write_bytes(uploaded.getbuffer())
+        uploaded_name = Path(uploaded.name).name
+        (upload_dir / uploaded_name).write_bytes(uploaded.getbuffer())
         input_dir = upload_dir
-        st.caption(f"Using uploaded **{uploaded.name}**")
+        st.caption(f"Using uploaded **{uploaded_name}**")
 
     st.header("Steps")
     do_tempo = st.checkbox("1 — Tempo correction", value=True)
@@ -180,10 +180,15 @@ with st.sidebar:
         f"GPU: **{torch.cuda.get_device_name(0)}**" if cuda else "No CUDA device detected"
     )
 
-    run = st.button("Run restoration", type="primary", use_container_width=True)
+    run = st.button(
+        "Run restoration",
+        type="primary",
+        use_container_width=True,
+        disabled=uploaded is None,
+    )
 
-if not input_dir.is_dir():
-    st.warning(f"Stem folder not found: `{input_dir}`")
+if uploaded is None:
+    st.info("Upload one audio file in the sidebar to begin.")
     st.stop()
 
 try:
@@ -192,8 +197,8 @@ except FFmpegNotFound as error:
     st.error(str(error))
     st.stop()
 
-if not paths:
-    st.warning(f"No audio files in `{input_dir}`")
+if len(paths) != 1:
+    st.error("Expected exactly one uploaded audio file. Please upload the file again.")
     st.stop()
 
 with st.expander("What each step uses, and why", expanded=False):
@@ -201,9 +206,9 @@ with st.expander("What each step uses, and why", expanded=False):
         """
 | Step | Fixes | Model | Why this one |
 |---|---|---|---|
-| **1 — Tempo correction** | BPM wandering across the track | [Beat This!](https://github.com/CPJKU/beat_this) (CPJKU, MIT) | Beats are tracked on **one** reference stem — drums, else bass, else instrumental — and the resulting time-warp is applied to every stem. Tracking each stem separately would give each its own warp and drift them apart. |
+| **1 — Tempo correction** | BPM wandering across the track | [Beat This!](https://github.com/CPJKU/beat_this) (CPJKU, MIT) | Beats are tracked on the uploaded audio and the resulting time-warp is applied to that file. Low-confidence material is left unchanged. |
 | **2 — Denoise** | Hiss, crackle, "AI shimmer" | Mel-Roformer-Denoise-Aufr33, via [audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | A music source-separation model that splits a clean track from the noise. **DeepFilterNet was rejected**: it calls itself a *Speech* Enhancement Framework, and on bass or drums it suppresses musical content it cannot recognise as speech. |
-| **3 — Bandwidth extension** | Frequencies missing above the export cutoff | [Apollo](https://github.com/JusperLee/Apollo) (JusperLee) | Trained on MP3 codec artifacts and evaluated on separated-stem data, which matches this input. **AudioSR was rejected**: it needs ~7.2GB and does not fit an 8GB card, and it is trained on synthetic low-pass rather than codec cutoffs. **UniverSR was rejected**: its highest input mode assumes content stops at 12kHz, but these stems carry real content to 16–18.5kHz, which it would discard first. |
+| **3 — Bandwidth extension** | Frequencies missing above the export cutoff | [Apollo](https://github.com/JusperLee/Apollo) (JusperLee) | Trained on MP3 codec artifacts and evaluated on separated-stem data, which matches this input. **AudioSR was rejected**: it needs ~7.2GB and does not fit an 8GB card, and it is trained on synthetic low-pass rather than codec cutoffs. **UniverSR was rejected**: its highest input mode assumes content stops at 12kHz, but these exports can carry real content to 16–18.5kHz, which it would discard first. |
 
 **Decoding.** Everything is read through ffmpeg, not soundfile. Suno's exports are
 low-bitrate MP3s with unreliable headers, and libsndfile silently truncates most of
@@ -217,12 +222,12 @@ from what sits below the cutoff — feeding it noise extends the noise.
 
 **Sample rate.** Stems are handled at 48kHz. Apollo is built for 44.1kHz and does no
 resampling of its own, so audio is converted down for it and back afterwards; without
-that its output returns 8.8% sharp and stems end up at mixed rates.
+that its output returns 8.8% sharp and changes the file's playback speed.
 """
     )
 
-st.subheader(f"{len(paths)} stem{'s' if len(paths) != 1 else ''} found")
-st.write(", ".join(f"`{p.name}`" for p in paths))
+st.subheader("File ready")
+st.write(f"`{paths[0].name}`")
 
 if not run:
     st.info("Set the steps you want in the sidebar, then run.")
@@ -230,12 +235,12 @@ if not run:
 
 source_by_name = {p.stem: p for p in paths}
 
-with st.status("Loading stems…", expanded=True) as load_status:
+with st.status("Loading audio…", expanded=True) as load_status:
     rows = []
     for path in paths:
         audio, sr = load_audio(path)
         rows.append({
-            "stem": path.stem,
+            "file": path.name,
             "duration": f"{audio.shape[0]/sr:.1f}s",
             "cutoff": format_hz(spectral_cliff_hz(audio, sr)),
             "energy >13kHz": f"{energy_above_hz(audio, sr):.2f}%",
@@ -246,9 +251,9 @@ with st.status("Loading stems…", expanded=True) as load_status:
     st.caption(
         "**cutoff** is where the spectrum falls off a cliff — the lower it is, the more "
         "treble is missing. **energy >13kHz** is how much of the signal lives above that "
-        "line. A **silent** stem is passed through untouched: there is nothing to restore."
+        "line. A **silent** file is passed through untouched: there is nothing to restore."
     )
-    load_status.update(label=f"Inspected {len(paths)} stems at {TARGET_SR}Hz", state="complete")
+    load_status.update(label=f"Inspected audio at {TARGET_SR}Hz", state="complete")
 
 tempo_status = st.status(
     "Step 1 — Tempo correction" if do_tempo else "Step 1 — Tempo correction (skipped)",
@@ -257,16 +262,16 @@ tempo_status = st.status(
 if do_tempo:
     with tempo_status:
         st.write(
-            "Beat-tracks one reference stem and applies that single time-warp to "
-            "every stem, so they stay aligned with each other."
+            "Beat-tracks the uploaded audio and applies the resulting time-warp "
+            "to this file only."
         )
 
-stem_status = st.status("Steps 2-3 — Restoring stems", expanded=True)
+stem_status = st.status("Steps 2-3 — Restoring file", expanded=True)
 with stem_status:
     st.write(
-        "Each stem is denoised and bandwidth-extended, then written immediately. "
+        "The file is denoised and bandwidth-extended, then written immediately. "
         "The residual figure is how loud the removed noise was — far below the "
-        "signal means the stem was already clean."
+        "signal means the audio was already clean."
     )
     stem_lines = st.empty()
 
@@ -303,7 +308,7 @@ def render_stem(entry: pipeline.StemReport) -> None:
             parts.append("; ".join(done.notes))
         lines.append(" — ".join(parts))
     stem_lines.markdown("\n\n".join(f"- {line}" for line in lines))
-    stem_status.update(label=f"Steps 2-3 — {len(completed)}/{len(paths)} stems restored")
+    stem_status.update(label="Steps 2-3 — File restored")
 
 
 try:
@@ -328,9 +333,16 @@ except bandwidth.ApolloUnavailable as error:
     st.error(str(error))
     st.stop()
 
-if not do_tempo:
+if report.tempo_decision is not None and not report.tempo_decision.run:
+    # `render_tempo` only fires when the warp is actually computed, so a step
+    # the gate declined would otherwise leave this spinner running forever.
+    # Saying why it was skipped is more useful than saying nothing happened.
+    with tempo_status:
+        st.write(report.tempo_decision.reason)
+    tempo_status.update(label="Step 1 — tempo correction skipped", state="complete")
+elif not do_tempo:
     tempo_status.update(state="complete")
-stem_status.update(label=f"Steps 2-3 — {len(completed)} stems restored", state="complete")
+stem_status.update(label="Steps 2-3 — File restored", state="complete")
 
 st.subheader("Results")
 st.caption(
@@ -351,8 +363,8 @@ for name, entry in report.stems.items():
             st.caption("Restored")
             st.audio(str(entry.output_path))
 
-        # Re-read both rather than holding originals in memory for the whole run:
-        # at full length a duplicate set of stems costs several hundred MB.
+        # Re-read both rather than holding the original in memory for the whole run:
+        # at full length a duplicate audio buffer can cost several hundred MB.
         original_audio, original_sr = load_audio(source_by_name[name])
         restored_audio, restored_sr = load_audio(entry.output_path, target_sr=None)
         pairs = [
@@ -364,4 +376,4 @@ for name, entry in report.stems.items():
         # nothing happened; the spectrum is where bandwidth extension shows up.
         st.pyplot(spectrum_figure(pairs))
 
-st.success(f"Wrote {len(completed)} restored stems to `{output_dir}`")
+st.success(f"Wrote restored file to `{output_dir}`")
