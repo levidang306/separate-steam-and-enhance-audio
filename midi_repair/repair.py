@@ -275,7 +275,11 @@ def find_donor(target_pitch, library):
 
 
 def render_window(target_audio, sr, donor_library, target_notes, window_start, window_end):
-    window_len = int((window_end - window_start) * sr)
+    # Clamped to what is actually left in the file. The flagged region comes
+    # from frame times that can round past the final sample, and a window longer
+    # than the audio it replaces produces a patch that cannot be spliced back in.
+    start_n = max(0, int(window_start * sr))
+    window_len = max(0, min(int((window_end - window_start) * sr), len(target_audio) - start_n))
     rendered = np.zeros(window_len)
     placements = []
     for target in target_notes:
@@ -303,17 +307,40 @@ def render_window(target_audio, sr, donor_library, target_notes, window_start, w
 
 
 def equal_power_crossfade_splice(base, patch, start_s, sr, fade_s=0.05):
-    fade_n = int(fade_s * sr)
-    start_n = int(start_s * sr)
+    """Drop `patch` into `base` at `start_s`, crossfading both seams.
+
+    The patch is trimmed to the room available rather than assumed to fit. Its
+    length comes from the notes that were re-rendered, not from the file, so a
+    region near the end of the track can produce more audio than there is space
+    for. Previously the destination slice silently clipped at the end of `base`
+    while the source slice did not, and the assignment failed on a shape
+    mismatch -- 64629 samples into 60343.
+    """
+    out = base.copy()
+    start_n = max(0, int(start_s * sr))
+    if start_n >= len(base) or len(patch) == 0:
+        return out
+
+    patch = patch[: len(base) - start_n]
     end_n = start_n + len(patch)
+
+    # Each seam needs a fade on both sides of it, so the two fades together
+    # cannot be longer than the patch.
+    fade_n = int(max(0, min(fade_s * sr, len(patch) // 2)))
+    if fade_n == 0:
+        out[start_n:end_n] = patch
+        return out
+
     t = np.linspace(0, np.pi / 2, fade_n)
     fade_out, fade_in = np.cos(t), np.sin(t)
-    out = base.copy()
-    a_seg, b_seg = base[start_n : start_n + fade_n], patch[:fade_n]
-    out[start_n : start_n + fade_n] = a_seg * fade_out[: len(a_seg)] + b_seg * fade_in[: len(a_seg)]
+
+    out[start_n : start_n + fade_n] = (
+        base[start_n : start_n + fade_n] * fade_out + patch[:fade_n] * fade_in
+    )
     out[start_n + fade_n : end_n - fade_n] = patch[fade_n : len(patch) - fade_n]
-    a_seg, b_seg = patch[len(patch) - fade_n :], base[end_n - fade_n : end_n]
-    out[end_n - fade_n : end_n] = a_seg * fade_out[: len(a_seg)] + b_seg * fade_in[: len(a_seg)]
+    out[end_n - fade_n : end_n] = (
+        patch[len(patch) - fade_n :] * fade_out + base[end_n - fade_n : end_n] * fade_in
+    )
     return out
 
 

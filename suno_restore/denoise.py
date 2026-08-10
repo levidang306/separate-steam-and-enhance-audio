@@ -74,6 +74,13 @@ def _run_model(
     actually kept the channels is reported separately, by comparing what it
     wrote against what went in.
     """
+    # `TemporaryDirectory(dir=...)` requires the parent to exist already and
+    # raises FileNotFoundError if it does not. Callers hand us a scratch path
+    # they intend to be used, not one they promise to have created, so create
+    # it rather than making every caller remember to.
+    if work_dir is not None:
+        Path(work_dir).mkdir(parents=True, exist_ok=True)
+
     with tempfile.TemporaryDirectory(dir=work_dir) as tmp:
         tmp_path = Path(tmp)
         source = save_audio(tmp_path / "input.wav", audio, sr)

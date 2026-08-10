@@ -61,11 +61,17 @@ def restore_from_stem(
     version_3_dir = output_dir / "v3"
     stage_a_dir = work_dir / "v2"
     stage_b_input_dir = work_dir / "v3_input"
+    # Scratch space for Version 3. It was passed to `suno_restore.restore`
+    # without ever being created, which held for as long as the denoise step
+    # kept being skipped -- it is the first thing to open a temporary directory
+    # inside it, and `TemporaryDirectory(dir=...)` will not create its parent.
+    stage_b_work_dir = work_dir / "v3"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     version_2_dir.mkdir(parents=True, exist_ok=True)
     version_3_dir.mkdir(parents=True, exist_ok=True)
     stage_a_dir.mkdir(parents=True, exist_ok=True)
+    stage_b_work_dir.mkdir(parents=True, exist_ok=True)
     if stage_b_input_dir.exists():
         shutil.rmtree(stage_b_input_dir)
     stage_b_input_dir.mkdir(parents=True, exist_ok=True)
@@ -117,7 +123,7 @@ def restore_from_stem(
         do_bandwidth=do_bandwidth,
         apollo_repo=apollo_repo,
         device=device or "cpu",
-        work_dir=work_dir / "v3",
+        work_dir=stage_b_work_dir,
         progress=progress,
         on_tempo=on_tempo,
         on_stem=on_stem,
