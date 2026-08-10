@@ -4,6 +4,36 @@ Suno can let the tempo wander across a song. This detects the beat grid once, on
 one reference stem, and applies the resulting time-warp identically to every
 stem. Beat-tracking each stem separately would give each its own warp and drift
 the stems apart, which defeats the point of exporting stems at all.
+
+The warp is applied as a *single continuous pass* over the whole signal. The
+previous version cut the timeline at every beat, time-stretched each piece with
+an independent `librosa.effects.time_stretch` call, and glued the results back
+together with a 5ms linear crossfade. Every one of those joins was audible, for
+three separate reasons, all of them measured on a pure 440Hz tone -- a signal
+whose envelope is flat by construction, so any dip in it is manufactured:
+
+  * `librosa.effects.time_stretch` runs an STFT and an inverse STFT. The last
+    synthesis windows of a segment are not fully overlap-added, so the segment
+    *decays* at its tail: 13dB down over the final milliseconds at rate 0.99.
+    A 5ms crossfade cannot cover a decay that spans a whole 2048-sample window.
+  * Each call ran its own phase vocoder, which starts phase accumulation from
+    scratch. Phase at a segment boundary was therefore arbitrary, and
+    crossfading two copies of the same partial at different phases cancels
+    rather than sums.
+  * Joins consumed 5ms of material each. Segments that were stretched had that
+    5ms added back; segments left at rate 1.0 by `MIN_CORRECTION` did not, so
+    those joins deleted 5ms of music outright.
+
+Measured on the 440Hz tone at a realistic beat spacing, the three together put a
+level dip at nearly every join, worst case 9.2dB, once per beat for the length
+of the track. That is what "not fully smooth" sounds like.
+
+There is no way to crossfade that away, because the crossfade is what causes it.
+So there are no segments and no joins here any more. The beat grid becomes a
+continuous, monotonic map from source time to output time, and one variable-rate
+phase vocoder walks the whole signal through it. Beats still land exactly on the
+grid -- they are the anchors of the map -- but between them the rate now varies
+smoothly instead of stepping, and the phase accumulator never restarts.
 """
 
 from __future__ import annotations
@@ -20,16 +50,20 @@ from .metrics import tempo_stability
 # the last resort.
 REFERENCE_PRIORITY = ("drum", "bass", "instrumental", "guitar", "piano")
 
-# Below this deviation a segment is copied rather than stretched. Phase-vocoder
-# stretching always costs some smearing, so it should not be spent undoing
+# Below this deviation an interval is left alone rather than warped. Any
+# resynthesis costs some smearing, so it should not be spent undoing
 # rounding-level differences.
 MIN_CORRECTION = 0.005
 
-# Segments needing more than this are treated as beat-tracking failures rather
+# Intervals needing more than this are treated as beat-tracking failures rather
 # than tempo drift, and left alone.
 MAX_RATE_DEVIATION = (0.80, 1.25)
 
-CROSSFADE_S = 0.005
+# Phase-vocoder resolution. 2048/512 at 44.1-48kHz is the usual compromise
+# between frequency resolution (which sets how cleanly partials separate) and
+# time resolution (which sets how much transients smear).
+N_FFT = 2048
+HOP_LENGTH = 512
 
 
 class NoReferenceStem(RuntimeError):
@@ -53,11 +87,11 @@ class TempoAnalysis:
             return (
                 f"{self.target_bpm:.1f} BPM on '{self.reference_stem}', "
                 f"spread ±{self.before.get('std_bpm', float('nan')):.2f} BPM — "
-                "no segment exceeded the correction threshold, audio unchanged"
+                "no interval exceeded the correction threshold, audio unchanged"
             )
         return (
             f"{self.target_bpm:.1f} BPM on '{self.reference_stem}': corrected "
-            f"{self.applied['segments_corrected']}/{self.applied['segments_total']} segments, "
+            f"{self.applied['segments_corrected']}/{self.applied['segments_total']} intervals, "
             f"median {self.applied['median_correction_pct']:.2f}%, "
             f"max {self.applied['max_correction_pct']:.2f}%, "
             f"length {self.applied['length_change_pct']:+.2f}%"
@@ -122,12 +156,15 @@ def analyse(audio: np.ndarray, sr: int, reference_stem: str, device: str = "cpu"
     )
 
 
-def _segment_bounds(
+def warp_anchors(
     analysis: TempoAnalysis, n_samples: int, sr: int
-) -> list[tuple[int, int, float]]:
-    """Split the timeline into (start, end, stretch_rate) segments.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Source and output sample positions the warp must map onto each other.
 
-    Rate follows librosa's convention: >1 shortens a segment, <1 lengthens it.
+    The two arrays are the same length and both strictly increasing, so the map
+    between them is continuous and invertible by construction. That property is
+    the whole point: it is what lets the warp be applied in one pass, and a
+    one-pass warp is what has no seams in it.
 
     Consecutive detected beats are not necessarily one beat apart. Beat This!
     drops beats wherever the reference stem falls quiet -- on the reference set
@@ -135,81 +172,238 @@ def _segment_bounds(
     to 28 seconds. Each gap is therefore measured in whole beats before being
     corrected; forcing every gap to a single beat collapsed the track to 79% of
     its length.
+
+    The material before the first beat and after the last sits outside the grid,
+    so it has nothing to align to and is carried at rate 1.0.
     """
-    beats = analysis.beat_times
     target_samples = int(round(analysis.target_interval_s * sr))
+    beats = np.unique(np.clip(np.round(analysis.beat_times * sr), 0, n_samples).astype(np.int64))
+    beats = beats[(beats > 0) & (beats < n_samples)]
 
-    edges = [0]
-    edges.extend(int(round(t * sr)) for t in beats)
-    edges.append(n_samples)
-    edges = sorted({min(max(e, 0), n_samples) for e in edges})
+    if len(beats) < 2 or target_samples <= 0:
+        return np.array([0, n_samples], dtype=np.float64), np.array(
+            [0, n_samples], dtype=np.float64
+        )
 
-    segments = []
-    for index, (start, end) in enumerate(zip(edges, edges[1:])):
-        length = end - start
-        if length <= 0:
-            continue
+    source = [0.0, float(beats[0])]
+    output = [0.0, float(beats[0])]
+    for start, end in zip(beats, beats[1:]):
+        length = int(end - start)
+        beats_spanned = max(1, int(round(length / target_samples)))
+        target = beats_spanned * target_samples
+        rate = length / target
+        # A rate this far off is a tracking failure, not drift; warping to match
+        # it would do more damage than the drift it claims to fix.
+        if not MAX_RATE_DEVIATION[0] <= rate <= MAX_RATE_DEVIATION[1]:
+            target = length
+        elif abs(rate - 1.0) < MIN_CORRECTION:
+            target = length
+        source.append(float(end))
+        output.append(output[-1] + float(max(1, target)))
 
-        # Head and tail sit outside the beat grid, so there is nothing to align
-        # them to; only inter-beat segments get corrected.
-        inside_grid = 0 < index < len(edges) - 2
-        rate = 1.0
-        if inside_grid and target_samples > 0:
-            beats_spanned = max(1, round(length / target_samples))
-            # Each crossfaded join consumes CROSSFADE_S of material, so segments
-            # are stretched that much longer to compensate. Without this the
-            # track loses ~0.3% of its length across ~190 joins -- more than a
-            # tenth of the drift the step exists to correct.
-            target = beats_spanned * target_samples + int(CROSSFADE_S * sr)
-            rate = length / target
-            # A rate this far off is a tracking failure, not drift; stretching to
-            # match it would do more damage than the drift it claims to fix.
-            if not MAX_RATE_DEVIATION[0] <= rate <= MAX_RATE_DEVIATION[1]:
-                rate = 1.0
+    # Tail, outside the grid: carried at rate 1.0.
+    if n_samples > source[-1]:
+        tail = n_samples - source[-1]
+        source.append(float(n_samples))
+        output.append(output[-1] + tail)
 
-        if abs(rate - 1.0) < MIN_CORRECTION:
-            rate = 1.0
-        segments.append((start, end, rate))
-    return segments
+    return np.asarray(source, dtype=np.float64), np.asarray(output, dtype=np.float64)
 
 
-def _stretch(segment: np.ndarray, rate: float) -> np.ndarray:
-    if rate == 1.0 or segment.shape[0] < 4096:
-        return segment
-    if segment.ndim == 1:
-        return librosa.effects.time_stretch(segment, rate=rate)
-    # librosa expects channels-first for multichannel input.
-    return librosa.effects.time_stretch(segment.T, rate=rate).T
+def _source_positions(
+    source: np.ndarray, output: np.ndarray, positions: np.ndarray
+) -> np.ndarray:
+    """Invert the warp: where in the source does each output position come from?
+
+    A monotone cubic (PCHIP) interpolant is used rather than a straight line
+    through the anchors. Both place the beats identically -- they agree at every
+    anchor -- but the piecewise-linear version has a slope discontinuity at each
+    one, which is a step change in playback rate on every beat. PCHIP is
+    C1-continuous and preserves monotonicity, so the rate glides between
+    intervals instead of stepping, and the map still cannot fold back on itself.
+    """
+    if len(output) < 3:
+        return np.interp(positions, output, source)
+    try:
+        from scipy.interpolate import PchipInterpolator
+
+        return PchipInterpolator(output, source, extrapolate=True)(positions)
+    except ImportError:  # pragma: no cover - scipy is a hard dependency elsewhere
+        return np.interp(positions, output, source)
 
 
-def _concat_with_crossfade(pieces: list[np.ndarray], sr: int) -> np.ndarray:
-    """Join stretched segments, crossfading the seams to suppress clicks."""
-    pieces = [p for p in pieces if p.shape[0] > 0]
-    if not pieces:
-        return np.zeros(0, dtype=np.float32)
+def _phase_advance(spectrum: np.ndarray, frames: np.ndarray, expected: np.ndarray) -> np.ndarray:
+    """True phase advance over one analysis hop, at each read position.
 
-    fade = int(CROSSFADE_S * sr)
-    out = pieces[0]
-    for piece in pieces[1:]:
-        n = min(fade, out.shape[0], piece.shape[0])
-        if n <= 0:
-            out = np.concatenate([out, piece], axis=0)
-            continue
-        ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
-        if out.ndim == 2:
-            ramp = ramp[:, None]
-        blended = out[-n:] * (1 - ramp) + piece[:n] * ramp
-        out = np.concatenate([out[:-n], blended, piece[n:]], axis=0)
-    return out.astype(np.float32)
+    `expected` is the phase a bin would advance by if it sat exactly on its bin
+    centre. What a partial actually does is that plus a wrapped deviation, and
+    the deviation is what carries its real frequency.
+    """
+    left = np.angle(spectrum[:, frames])
+    right = np.angle(spectrum[:, np.minimum(frames + 1, spectrum.shape[1] - 1)])
+    deviation = right - left - expected
+    deviation -= 2.0 * np.pi * np.round(deviation / (2.0 * np.pi))
+    return (expected + deviation).astype(np.float64)
+
+
+def _lock_phase_to_peaks(
+    magnitude: np.ndarray, rotation: np.ndarray, block: int = 512
+) -> np.ndarray:
+    """Give every bin the phase rotation of the spectral peak it belongs to.
+
+    A phase vocoder advances each bin independently, so the bins that together
+    describe one partial drift out of step with each other. The partial stays at
+    the right frequency but loses its shape, which is the hollow, watery
+    "phasiness" a vocoder is known for. Locking each bin to the peak dominating
+    its neighbourhood -- Laroche and Dolson's identity locking -- keeps the
+    bins of a partial rotating together, so the waveform keeps its shape.
+
+    Only the *rotation* is locked, never the measured phase, so the stereo image
+    and the fine structure of the source both survive untouched.
+
+    Frames are independent of each other here, so they are done in blocks: the
+    index arrays this needs are the same size as the spectrogram, and a whole
+    track's worth of them at once is several hundred megabytes for no benefit.
+    """
+    if magnitude.shape[1] > block:
+        for start in range(0, magnitude.shape[1], block):
+            stop = start + block
+            rotation[:, start:stop] = _lock_phase_to_peaks(
+                magnitude[:, start:stop], rotation[:, start:stop], block
+            )
+        return rotation
+
+    bins = magnitude.shape[0]
+    louder_than_below = np.empty_like(magnitude, dtype=bool)
+    louder_than_above = np.empty_like(magnitude, dtype=bool)
+    louder_than_below[0] = True
+    louder_than_below[1:] = magnitude[1:] >= magnitude[:-1]
+    louder_than_above[-1] = True
+    louder_than_above[:-1] = magnitude[:-1] >= magnitude[1:]
+    peaks = louder_than_below & louder_than_above
+
+    # Nearest peak at or below each bin, and at or above it; whichever is closer
+    # owns the bin. `maximum.accumulate` over the peak indices does the
+    # fill-forward, and the same trick reversed does the fill-backward.
+    index = np.arange(bins, dtype=np.int32)[:, None]
+    below = np.where(peaks, index, -1)
+    np.maximum.accumulate(below, axis=0, out=below)
+    above = np.where(peaks, index, bins)
+    above = np.minimum.accumulate(above[::-1], axis=0)[::-1]
+
+    below_valid = below >= 0
+    above_valid = above < bins
+    below_safe = np.where(below_valid, below, 0)
+    above_safe = np.where(above_valid, above, bins - 1)
+    take_below = below_valid & (
+        ~above_valid | ((index - below_safe) <= (above_safe - index))
+    )
+    owner = np.where(take_below, below_safe, above_safe)
+
+    return np.take_along_axis(rotation, owner, axis=0)
+
+
+def _warp_channel(
+    signal: np.ndarray | None,
+    rotation: np.ndarray,
+    read_frames: np.ndarray,
+    read_fraction: np.ndarray,
+    length: int,
+    spectrum: np.ndarray | None = None,
+) -> np.ndarray:
+    """Resynthesise one channel at the warped positions, using a shared rotation.
+
+    Every channel is turned by the *same* phase rotation, derived once from the
+    downmix. Running an independent vocoder per channel is the usual way to do
+    this and it quietly widens or collapses the image, because the phase
+    relationship between left and right is exactly what stereo is made of and
+    two independent accumulators do not preserve it. One shared rotation moves
+    both channels through time together and leaves that relationship intact.
+    """
+    if spectrum is None:
+        spectrum = librosa.stft(signal, n_fft=N_FFT, hop_length=HOP_LENGTH)
+    right_frames = np.minimum(read_frames + 1, spectrum.shape[1] - 1)
+    read = spectrum[:, read_frames]
+    magnitude = (1.0 - read_fraction) * np.abs(read) + (
+        read_fraction * np.abs(spectrum[:, right_frames])
+    )
+    # `read / |read|` is the source phase as a unit vector -- the same thing as
+    # `exp(1j*angle(read))` without building the intermediate angle array.
+    unit = np.divide(read, np.abs(read), out=np.ones_like(read), where=np.abs(read) > 0)
+    warped = (magnitude * unit * np.exp(1j * rotation)).astype(np.complex64)
+    del read, magnitude, unit
+    return librosa.istft(warped, hop_length=HOP_LENGTH, n_fft=N_FFT, length=length)
 
 
 def apply_warp(audio: np.ndarray, sr: int, analysis: TempoAnalysis) -> np.ndarray:
-    """Apply the shared time-warp to one stem."""
-    segments = _segment_bounds(analysis, audio.shape[0], sr)
-    if all(rate == 1.0 for _, _, rate in segments):
+    """Apply the shared time-warp to one stem, in a single continuous pass."""
+    n_samples = audio.shape[0]
+    source, output = warp_anchors(analysis, n_samples, sr)
+    if np.allclose(source, output):
         return audio
-    pieces = [_stretch(audio[start:end], rate) for start, end, rate in segments]
-    return _concat_with_crossfade(pieces, sr)
+
+    out_length = int(round(output[-1]))
+    if out_length < N_FFT or n_samples < N_FFT:
+        return audio
+
+    # One output frame every HOP_LENGTH samples; each reads from wherever in the
+    # source that output instant came from. One frame past the end, so the final
+    # samples are synthesised from a full overlap-add rather than a fading tail.
+    out_frames = -(-out_length // HOP_LENGTH) + 2
+    read_positions = _source_positions(
+        source, output, np.arange(out_frames, dtype=np.float64) * HOP_LENGTH
+    )
+    read_positions = np.clip(read_positions, 0.0, float(n_samples - 1))
+    read_steps = read_positions / HOP_LENGTH
+
+    mono = to_mono(audio).astype(np.float32)
+    reference = librosa.stft(mono, n_fft=N_FFT, hop_length=HOP_LENGTH)
+    max_frame = reference.shape[1] - 1
+    read_frames = np.clip(read_steps.astype(np.int64), 0, max_frame)
+    read_fraction = np.clip(read_steps - read_frames, 0.0, 1.0)
+
+    expected = (
+        2.0 * np.pi * HOP_LENGTH * np.arange(reference.shape[0]) / N_FFT
+    )[:, None].astype(np.float64)
+
+    # The phase to synthesise with is the running sum of one hop's worth of true
+    # advance per output frame -- the accumulator that the old per-segment code
+    # restarted at every beat. Here it runs once, over the whole track.
+    advance = _phase_advance(reference, read_frames, expected)
+    rotation = np.cumsum(advance, axis=1, dtype=np.float64)
+    rotation -= advance
+    # Frame 0 synthesises at the source's own phase, so the accumulator starts
+    # there. Dropping this constant would leave every bin turned by a fixed
+    # angle for the whole track -- an all-pass filter nobody asked for, which
+    # smears exactly the transients this step is trying not to damage.
+    rotation += np.angle(reference[:, read_frames[0]])[:, None]
+    del advance, expected
+    # Only the rotation relative to the source phase matters, and it is used as
+    # `exp(1j*rotation)`, so wrapping it here costs nothing and keeps a track's
+    # worth of accumulated radians from needing the range that float64 was
+    # holding it in.
+    rotation -= np.angle(reference[:, read_frames])
+    rotation -= 2.0 * np.pi * np.round(rotation / (2.0 * np.pi))
+    rotation = _lock_phase_to_peaks(np.abs(reference[:, read_frames]), rotation)
+
+    if audio.ndim == 1:
+        warped = _warp_channel(
+            None, rotation, read_frames, read_fraction, out_length, spectrum=reference
+        )
+        return warped.astype(np.float32)
+    del reference
+
+    channels = [
+        _warp_channel(
+            np.ascontiguousarray(audio[:, index], dtype=np.float32),
+            rotation,
+            read_frames,
+            read_fraction,
+            out_length,
+        )
+        for index in range(audio.shape[1])
+    ]
+    return np.stack(channels, axis=1).astype(np.float32)
 
 
 def describe_warp(analysis: TempoAnalysis, n_samples: int, sr: int) -> dict:
@@ -220,18 +414,20 @@ def describe_warp(analysis: TempoAnalysis, n_samples: int, sr: int) -> dict:
     number of beats each time, so the comparison measures tracker noise rather
     than the correction.
     """
-    segments = _segment_bounds(analysis, n_samples, sr)
-    corrections = [abs(rate - 1.0) * 100 for _, _, rate in segments if rate != 1.0]
-    fade = int(CROSSFADE_S * sr)
-    warped_length = sum(
-        (end - start) if rate == 1.0 else (end - start) / rate for start, end, rate in segments
-    ) - fade * max(0, len(segments) - 1)
+    source, output = warp_anchors(analysis, n_samples, sr)
+    source_spans = np.diff(source)
+    output_spans = np.diff(output)
+    ratios = np.divide(
+        source_spans, output_spans, out=np.ones_like(source_spans), where=output_spans > 0
+    )
+    corrections = np.abs(ratios - 1.0) * 100
+    corrected = corrections[corrections > 0]
     return {
-        "segments_total": len(segments),
-        "segments_corrected": len(corrections),
-        "median_correction_pct": float(np.median(corrections)) if corrections else 0.0,
-        "max_correction_pct": float(np.max(corrections)) if corrections else 0.0,
-        "length_change_pct": (warped_length / n_samples - 1) * 100 if n_samples else 0.0,
+        "segments_total": int(len(source_spans)),
+        "segments_corrected": int(len(corrected)),
+        "median_correction_pct": float(np.median(corrected)) if corrected.size else 0.0,
+        "max_correction_pct": float(np.max(corrected)) if corrected.size else 0.0,
+        "length_change_pct": (output[-1] / n_samples - 1) * 100 if n_samples else 0.0,
     }
 
 

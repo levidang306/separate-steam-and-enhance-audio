@@ -161,26 +161,59 @@ def process_chunked(
     """
     channels = 1 if audio.ndim == 1 else audio.shape[1]
     signal = audio if audio.ndim == 2 else audio[:, None]
+    length = signal.shape[0]
     overlap = max(0, min(overlap, chunk // 2))
     step = max(1, chunk - overlap)
 
-    output = np.zeros((signal.shape[0], channels), dtype=np.float32)
-    weights = np.zeros((signal.shape[0], 1), dtype=np.float32)
-
-    for start in range(0, signal.shape[0], step):
-        piece = signal[start:start + chunk]
-        if piece.shape[0] == 0 or (start > 0 and piece.shape[0] <= overlap):
+    # Spans are decided before anything is processed, so the fade flags can be
+    # set from which chunk actually neighbours which. Deciding them inside the
+    # loop meant asking "is this the last one?" from a position that could not
+    # yet see whether a further chunk would be taken, and a taper that fades out
+    # with nothing to fade into is a hole in the coverage.
+    spans = []
+    for start in range(0, length, step):
+        stop = min(start + chunk, length)
+        if stop <= start:
             break
-        result = process(piece)[: piece.shape[0]]
+        spans.append((start, stop))
+        if stop >= length:
+            break
+    # A final span shorter than the overlap is entirely covered by its
+    # predecessor already; processing it would only add a redundant seam.
+    while len(spans) > 1 and spans[-1][1] - spans[-1][0] <= overlap:
+        spans.pop()
+    if spans:
+        spans[-1] = (spans[-1][0], length)
 
-        last = start + chunk >= signal.shape[0] or start + step >= signal.shape[0]
+    output = np.zeros((length, channels), dtype=np.float32)
+    weights = np.zeros((length, 1), dtype=np.float32)
+
+    for index, (start, stop) in enumerate(spans):
+        piece = signal[start:stop]
+        result = np.asarray(process(piece))[: stop - start]
+        if result.ndim == 1:
+            result = result[:, None]
+        if result.shape[0] < piece.shape[0]:
+            # A model that returns short would otherwise leave the tail of its
+            # span carried by nothing, and the weight normalisation below would
+            # then divide near-silence by near-zero. Carry the source there
+            # instead: unextended is a far better failure than amplified noise.
+            result = np.concatenate([result, piece[result.shape[0]:]], axis=0)
+
         taper = chunk_window(
-            result.shape[0], overlap, fade_in=start > 0, fade_out=not last
+            result.shape[0],
+            overlap,
+            fade_in=index > 0,
+            fade_out=index < len(spans) - 1,
         )
         output[start:start + result.shape[0]] += result * taper
         weights[start:start + result.shape[0]] += taper
 
-    output /= np.maximum(weights, 1e-8)
+    # The tapers are complementary, so the weights are 1 everywhere a chunk
+    # reached. Anywhere they are not, the source is the honest answer.
+    covered = weights[:, 0] > 1e-6
+    output[covered] /= weights[covered]
+    output[~covered] = signal[~covered]
     return output[:, 0] if audio.ndim == 1 else output
 
 

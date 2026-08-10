@@ -81,9 +81,19 @@ def _run_model(
     if work_dir is not None:
         Path(work_dir).mkdir(parents=True, exist_ok=True)
 
+    # audio-separator normalises anything peaking above 0.9 and reports no gain
+    # back, so two passes over the same stem can be scaled differently. That is
+    # invisible in mono and destructive in mid/side, where mid usually peaks
+    # above the threshold and side does not: the two come back on different
+    # scales and the stereo image is rebuilt at the wrong width. Handing the
+    # model a peak it will never normalise, and undoing that known scaling
+    # afterwards, makes the gain of every pass identical and knowable.
+    peak = float(np.abs(audio).max()) if audio.size else 0.0
+    gain = (0.5 / peak) if peak > 0.5 else 1.0
+
     with tempfile.TemporaryDirectory(dir=work_dir) as tmp:
         tmp_path = Path(tmp)
-        source = save_audio(tmp_path / "input.wav", audio, sr)
+        source = save_audio(tmp_path / "input.wav", audio * gain, sr)
 
         # audio-separator keeps the output directory in two places and its own
         # internal redirect sets both; setting only the outer one leaves the
@@ -114,6 +124,8 @@ def _run_model(
 
     if written_channels < want_channels:
         setattr(separator, _MONO_ONLY_FLAG, True)
+    if gain != 1.0:
+        cleaned = (cleaned / gain).astype(np.float32)
     return cleaned
 
 
