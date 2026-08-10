@@ -1,9 +1,14 @@
 """Combined Version 2 -> Version 3 audio restoration pipeline.
 
 Version 2 (`midi_repair`) detects and repairs one localized damaged span.
-Version 3 (`suno_restore`) then measures tempo, noise, and bandwidth damage,
-runs only justified steps, blends conservatively, and verifies or rolls back
-the result. Both outputs are durable artifacts so callers can compare them.
+Version 3 (`suno_restore`) then runs tempo correction, denoise and bandwidth
+extension over the whole file -- each step unconditionally and at full strength
+if it is enabled.
+
+Both outputs are kept as durable artifacts rather than one overwriting the
+other. That matters more now than it used to: with no verification stage inside
+Version 3, the V2 output is the only surviving reference for judging whether V3
+improved the file or damaged it. `scripts/ab_quality.py` compares the two.
 """
 
 from __future__ import annotations
@@ -103,7 +108,7 @@ def restore_from_stem(
         f"with {'1 channel' if handoff_audio.ndim == 1 else f'{handoff_audio.shape[1]} channels'}"
     )
 
-    progress("Version 3 - gated, blended, and verified restoration")
+    progress("Version 3 - tempo, denoise and bandwidth restoration")
     stage_b_report = suno_restore.restore(
         stage_b_input_dir,
         version_3_dir,

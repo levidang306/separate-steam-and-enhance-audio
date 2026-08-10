@@ -333,15 +333,10 @@ except bandwidth.ApolloUnavailable as error:
     st.error(str(error))
     st.stop()
 
-if report.tempo_decision is not None and not report.tempo_decision.run:
-    # `render_tempo` only fires when the warp is actually computed, so a step
-    # the gate declined would otherwise leave this spinner running forever.
-    # Saying why it was skipped is more useful than saying nothing happened.
-    with tempo_status:
-        st.write(report.tempo_decision.reason)
-    tempo_status.update(label="Step 1 — tempo correction skipped", state="complete")
-elif not do_tempo:
-    tempo_status.update(state="complete")
+if not do_tempo:
+    # `render_tempo` only fires when the warp is computed, so an unticked step
+    # would otherwise leave this spinner running for the rest of the session.
+    tempo_status.update(label="Step 1 — tempo correction not requested", state="complete")
 stem_status.update(label="Steps 2-3 — File restored", state="complete")
 
 st.subheader("Results")

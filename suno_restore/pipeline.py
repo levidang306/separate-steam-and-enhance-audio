@@ -25,7 +25,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-from . import bandwidth, chain, denoise, gate, tempo
+from . import bandwidth, denoise, tempo
 from .audio_io import TARGET_SR, channel_count, is_effectively_silent, load_audio, save_audio
 from .config import settings as default_settings
 from .metrics import energy_above_hz, spectral_cliff_hz
@@ -54,16 +54,10 @@ class StemReport:
     output_channels: int = 0
     output_sr: int = 0
     stereo_strategy: str = ""
-    outcome: "chain.RestoreOutcome | None" = None
 
     @property
     def channels_preserved(self) -> bool:
         return self.input_channels == self.output_channels
-
-    @property
-    def engine_config(self) -> dict:
-        """The decisions and verification behind this stem, for the record."""
-        return self.outcome.engine_config if self.outcome else {}
 
 
 def check_integrity(
@@ -91,34 +85,6 @@ class RunReport:
     stems: dict[str, StemReport] = field(default_factory=dict)
     tempo_analysis: "tempo.TempoAnalysis | None" = None
     tempo_note: str = ""
-    tempo_decision: "gate.StepDecision | None" = None
-
-
-def _decide_shared_tempo(
-    stems: dict[str, tuple[np.ndarray, int]], requested: bool, device: str
-) -> "gate.StepDecision":
-    """One tempo decision for the whole stem set, on the best reference available.
-
-    The reference is chosen from percussive stems only. The old priority list
-    fell through to guitar and piano, which is how a solo guitar came to be
-    beat-tracked against its own uneven picking and warped by 375ms.
-    """
-    if not requested:
-        return gate.StepDecision(False, 0.0, "tempo not requested for this run", {})
-
-    candidates = gate.rank_reference_stems(list(stems))
-    if not candidates:
-        return gate.StepDecision(
-            run=False, confidence=0.0,
-            reason=f"no percussive reference stem; need one of {gate.REFERENCE_PRIORITY}",
-            measurements={"available_stems": sorted(stems)},
-        )
-
-    reference = candidates[0]
-    audio, sr = stems[reference]
-    return gate.decide_tempo(
-        audio, sr, stem_name=reference, available_stems=list(stems), is_separated=True,
-    )
 
 
 def discover_stems(input_dir: str | Path) -> list[Path]:
@@ -184,79 +150,49 @@ def restore(
             entry.notes.append("effectively silent -- passed through untouched")
         report.stems[name] = entry
 
-    # Tempo is decided once, for the whole set, on the best available reference.
-    # It has to stay a shared decision: beat-tracking each stem separately gives
-    # each its own warp and drifts them apart, which defeats the point of having
-    # stems. That is also why it sits outside `chain.restore_stem`, which is a
-    # per-stem view and cannot see the others.
-    tempo_decision = _decide_shared_tempo(stems, do_tempo, device)
-    report.tempo_decision = tempo_decision
-    if tempo_decision.run:
+    # Tempo runs once for the whole set. It has to stay a shared decision:
+    # beat-tracking each stem separately gives each its own warp and drifts them
+    # apart, which defeats the point of having stems at all.
+    if do_tempo:
         progress("Step 1 - tempo correction")
         stems, analysis = tempo.correct_tempo(stems, device=device)
         report.tempo_analysis = analysis
         report.tempo_note = analysis.summary()
         on_tempo(analysis)
     else:
-        report.tempo_note = f"skipped: {tempo_decision.reason}"
-        progress(f"Step 1 - tempo skipped ({tempo_decision.reason})")
+        report.tempo_note = "not requested for this run"
+        progress("Step 1 - tempo not requested")
 
-    # The denoise checkpoint is ~900MB and takes seconds to load, and now that
-    # the step is gated it is often not needed at all -- a clean stem set skips
-    # every stem. So it is loaded on first actual use rather than up front.
-    loaded = {"separator": separator}
-
-    def get_separator():
-        if loaded["separator"] is None:
-            progress("Step 2 - loading denoise model")
-            loaded["separator"] = denoise.load_separator(output_dir)
-        return loaded["separator"]
-
-    # Captured before the loop: stems are dropped as they are written, and the
-    # tempo gate's view of what is available must not shrink as it goes.
-    stem_names = list(stems)
+    if do_denoise and separator is None:
+        progress("Step 2 - loading denoise model")
+        separator = denoise.load_separator(output_dir)
 
     for name, (audio, sr) in list(stems.items()):
         entry = report.stems[name]
-        before_chain = audio
 
-        def denoise_model(signal: np.ndarray, rate: int, _name: str = name) -> np.ndarray:
-            progress(f"Step 2 - denoising {_name}")
-            result = denoise.denoise_stem(signal, rate, get_separator(), work_dir=work_dir)
+        if do_denoise and separator is not None:
+            progress(f"Step 2 - denoising {name}")
+            before = audio
+            result = denoise.denoise_stem(audio, sr, separator, work_dir=work_dir)
+            audio, sr = result.audio, result.sr
+            check_integrity("denoise", name, before, audio)
             entry.denoise_residual_db = result.residual_db
             entry.stereo_strategy = result.stereo_strategy
             entry.denoise_note = (
                 result.reason if result.skipped
                 else denoise.describe_residual(result.residual_db)
             )
-            return result.audio
 
-        def bandwidth_model(signal: np.ndarray, rate: int, _name: str = name) -> np.ndarray:
-            progress(f"Step 3 - extending bandwidth of {_name}")
+        if do_bandwidth and not entry.silent:
+            progress(f"Step 3 - extending bandwidth of {name}")
+            before = audio
             result = bandwidth.extend_stem(
-                signal, rate, apollo_repo, work_dir=work_dir, device=device
+                audio, sr, apollo_repo, work_dir=work_dir, device=device
             )
+            audio, sr = result.audio, result.sr
+            check_integrity("bandwidth", name, before, audio)
             entry.cliff_after_hz = result.cliff_after_hz
             entry.energy_after_pct = result.energy_after_pct
-            return result.audio
-
-        enabled = tuple(
-            step for step, wanted in
-            (("denoise", do_denoise),
-             ("bandwidth", do_bandwidth and not entry.silent))
-            if wanted
-        )
-        outcome = chain.restore_stem(
-            audio, sr,
-            denoise_model=denoise_model if "denoise" in enabled else None,
-            bandwidth_model=bandwidth_model if "bandwidth" in enabled else None,
-            stem_name=name,
-            available_stems=stem_names,
-            enable=enabled,
-        )
-        audio, sr = outcome.audio, outcome.sr
-        check_integrity("restoration chain", name, before_chain, audio)
-        entry.outcome = outcome
 
         if entry.cliff_after_hz is None:
             entry.cliff_after_hz = spectral_cliff_hz(audio, sr)

@@ -309,11 +309,9 @@ version_2_status.update(
     label="Version 2 — complete" if do_version_2 else "Version 2 — skipped",
     state="complete",
 )
-if combined.stage_b.tempo_decision is not None and not combined.stage_b.tempo_decision.run:
-    with tempo_status:
-        st.write(combined.stage_b.tempo_decision.reason)
-    tempo_status.update(label="Version 3 / Tempo — skipped safely", state="complete")
-elif not do_tempo:
+if not do_tempo:
+    # `render_tempo` only fires once the warp has been computed, so an unticked
+    # step would otherwise leave this spinner running for the rest of the run.
     tempo_status.update(label="Version 3 / Tempo — not requested", state="complete")
 version_3_status.update(label="Version 3 — complete", state="complete")
 
@@ -378,19 +376,15 @@ else:
     if version_2.notes:
         st.caption(" · ".join(version_2.notes))
 
-st.subheader("Version 3 decision")
+st.subheader("Version 3 result")
 version_3_entry = next(iter(combined.stage_b.stems.values()))
-outcome = version_3_entry.outcome
+steps_run = [
+    label for label, ticked in
+    (("tempo", do_tempo), ("denoise", do_denoise), ("bandwidth", do_bandwidth))
+    if ticked
+]
 cols = st.columns(4)
-if outcome is None:
-    version_3_outcome = "No report"
-elif outcome.is_enhanced:
-    version_3_outcome = "Enhanced"
-elif outcome.fell_back:
-    version_3_outcome = "Rolled back"
-else:
-    version_3_outcome = "Unchanged"
-cols[0].metric("Outcome", version_3_outcome)
+cols[0].metric("Steps run", " + ".join(steps_run) if steps_run else "none")
 cols[1].metric(
     "Channels",
     f"{version_3_entry.input_channels} → {version_3_entry.output_channels}",
@@ -404,8 +398,17 @@ st.caption(
     f"Energy above 13kHz: {format_pct(version_3_entry.energy_before_pct)} → "
     f"{format_pct(version_3_entry.energy_after_pct)}"
 )
-if outcome is not None:
-    st.code(outcome.summary(), language="text")
+if combined.stage_b.tempo_note:
+    st.caption(f"Tempo: {combined.stage_b.tempo_note}")
+if version_3_entry.denoise_note:
+    st.caption(f"Denoise: {version_3_entry.denoise_note}")
+
+# Every enabled step ran at full strength, so "it ran" is not the same as "it
+# helped". The plots above are the check; this is the pointer to the numbers.
+st.caption(
+    "Each ticked step ran unconditionally. To confirm the result is actually "
+    "better, measure it: `python scripts/ab_quality.py <original> <restored>`."
+)
 
 if combined.version_2_path is None:
     st.success(f"Version 2 was skipped. Saved Version 3 to `{output_dir / 'v3'}`.")

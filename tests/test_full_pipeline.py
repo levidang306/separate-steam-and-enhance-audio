@@ -9,7 +9,7 @@ import soundfile as sf
 
 import full_pipeline
 from midi_repair import EnhanceReport, preserve_source_layout
-from suno_restore import gate, pipeline
+from suno_restore import pipeline
 from suno_restore.audio_io import save_audio
 
 
@@ -74,10 +74,7 @@ def test_combined_pipeline_saves_and_exposes_each_version(tmp_path, monkeypatch)
             input_sr=staged_sr,
             output_sr=staged_sr,
         )
-        return pipeline.RunReport(
-            stems={"input": entry},
-            tempo_decision=gate.StepDecision(False, 0.0, "test skip", {}),
-        )
+        return pipeline.RunReport(stems={"input": entry})
 
     monkeypatch.setattr(full_pipeline.midi_repair, "enhance", fake_enhance)
     monkeypatch.setattr(full_pipeline.midi_repair, "unload_models", lambda: unloaded.append(True))
