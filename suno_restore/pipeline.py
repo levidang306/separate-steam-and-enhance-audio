@@ -201,9 +201,16 @@ def restore(
         report.tempo_note = f"skipped: {tempo_decision.reason}"
         progress(f"Step 1 - tempo skipped ({tempo_decision.reason})")
 
-    if do_denoise and separator is None:
-        progress("Step 2 - loading denoise model")
-        separator = denoise.load_separator(output_dir)
+    # The denoise checkpoint is ~900MB and takes seconds to load, and now that
+    # the step is gated it is often not needed at all -- a clean stem set skips
+    # every stem. So it is loaded on first actual use rather than up front.
+    loaded = {"separator": separator}
+
+    def get_separator():
+        if loaded["separator"] is None:
+            progress("Step 2 - loading denoise model")
+            loaded["separator"] = denoise.load_separator(output_dir)
+        return loaded["separator"]
 
     # Captured before the loop: stems are dropped as they are written, and the
     # tempo gate's view of what is available must not shrink as it goes.
@@ -215,7 +222,7 @@ def restore(
 
         def denoise_model(signal: np.ndarray, rate: int, _name: str = name) -> np.ndarray:
             progress(f"Step 2 - denoising {_name}")
-            result = denoise.denoise_stem(signal, rate, separator, work_dir=work_dir)
+            result = denoise.denoise_stem(signal, rate, get_separator(), work_dir=work_dir)
             entry.denoise_residual_db = result.residual_db
             entry.stereo_strategy = result.stereo_strategy
             entry.denoise_note = (
@@ -235,7 +242,7 @@ def restore(
 
         enabled = tuple(
             step for step, wanted in
-            (("denoise", do_denoise and separator is not None),
+            (("denoise", do_denoise),
              ("bandwidth", do_bandwidth and not entry.silent))
             if wanted
         )
