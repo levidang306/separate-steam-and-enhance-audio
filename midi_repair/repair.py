@@ -148,8 +148,16 @@ def _separate_stems(input_path, out_dir: Path, device: str) -> dict:
 def _transcribe(input_path, out_dir: Path, device: str) -> dict:
     import mido
 
+
+    import soundfile as sf
+
+    decoded_audio, decoded_sr = load_audio(input_path, target_sr=None)
+    decoded_path = out_dir / "transcribe_input.wav"
+    decoded_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(decoded_path), decoded_audio, decoded_sr, subtype="PCM_16")
+
     muscriptor_model = _load_muscriptor(device)
-    midi_bytes = muscriptor_model.transcribe_to_midi(str(input_path))
+    midi_bytes = muscriptor_model.transcribe_to_midi(str(decoded_path))
     midi_path = out_dir / "transcription.mid"
     midi_path.write_bytes(midi_bytes)
 
