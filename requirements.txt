@@ -1,15 +1,18 @@
 absl-py==2.5.0
 altair==6.2.2
 annotated-doc==0.0.5
+annotated-types==0.8.0
+anticipation @ git+https://github.com/jthickstun/anticipation@af37397922665a0fb8d474d7988b0f3755a38d45
 antlr4-python3-runtime==4.9.3
 anyio==4.14.2
 attrs==26.1.0
 audio-separator==0.44.5
 audioread==3.1.0
-audiosr==0.0.7
+#audiosr==0.0.7
 beartype==0.18.5
 beat-this==1.1.0
 blinker==1.9.0
+bs-roformer-infer==0.1.5
 certifi==2026.7.22
 cffi==2.1.1
 chardet==7.5.1
@@ -22,7 +25,9 @@ Cython==3.2.9
 decorator==5.3.1
 diffq-fixed==0.2.4
 dlinfo==2.0.0
+dtw-python==1.7.5
 einops==0.8.2
+fastapi==0.141.1
 filelock==3.32.2
 flatbuffers==25.12.19
 fonttools==4.63.0
@@ -38,6 +43,7 @@ idna==3.18
 itsdangerous==2.2.0
 Jinja2==3.1.6
 joblib==1.5.3
+jsonpickle==4.1.2
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 julius==0.2.8
@@ -49,10 +55,14 @@ markdown-it-py==4.2.0
 MarkupSafe==3.0.3
 matplotlib==3.11.1
 mdurl==0.1.2
+mido==1.3.3
 ml_collections==1.1.0
 ml_dtypes==0.5.4
+more-itertools==11.1.0
 mpmath==1.3.0
 msgpack==1.2.1
+muscriptor==0.3.0
+music21==10.5.0
 narwhals==2.24.0
 networkx==3.6.1
 numba==0.66.0
@@ -72,12 +82,15 @@ progressbar==2.5
 protobuf==7.35.1
 pyarrow==24.0.0
 pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
 pydeck==0.9.3
 pydub==0.25.1
 Pygments==2.20.0
 pyloudnorm==0.2.0
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
 python-multipart==0.0.32
 PyYAML==6.0.3
 referencing==0.37.0
@@ -104,34 +117,22 @@ threadpoolctl==3.6.0
 timm==1.0.28
 tokenizers==0.22.2
 toml==0.10.2
-torch==2.7.1+cu118
-torchaudio==2.7.1+cu118
+#torch==2.7.1+cu118
+#torchaudio==2.7.1+cu118
 torchlibrosa==0.1.0
-torchvision==0.22.1+cu118
+#torchvision==0.22.1+cu118
 tqdm==4.70.0
 transformers==5.14.1
 typer==0.27.1
+typing-inspection==0.4.2
 typing_extensions==4.16.0
 tzdata==2026.3
 Unidecode==1.4.0
 urllib3==2.7.0
 uvicorn==0.52.1
 watchdog==6.0.0
+watchfiles==1.2.0
 wcwidth==0.8.2
+webcolors==25.10.0
 websockets==16.1.1
 wheel==0.47.0
-
-# ---------------------------------------------------------------------------
-# Stage A -- midi_repair (ported from rewrite-v2 / requirements-enhanced-stem.txt):
-# stem separation, MIDI transcription, degradation detection, AMT infilling,
-# donor re-render. Verified with `pip install --dry-run` against everything
-# above (this file already has huggingface_hub==1.27.0, transformers==5.14.1,
-# torch==2.7.1+cu118, ml_collections==1.1.0 -- no changes needed there) --
-# zero resolver conflicts.
-# ---------------------------------------------------------------------------
-bs-roformer-infer==0.1.5
-muscriptor==0.3.0
-mido==1.3.3
-music21==10.5.0
-dtw-python==1.7.5
-anticipation @ git+https://github.com/jthickstun/anticipation@af37397922665a0fb8d474d7988b0f3755a38d45

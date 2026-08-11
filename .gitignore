@@ -1,2 +1,49 @@
+# Virtualenv
 .venv/
+
+# Audio in, audio out. Every stage of the pipeline writes under data/, and the
+# stems are hundreds of megabytes; none of it is source.
 data/
+
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+
+# Model weights pulled at runtime. Apollo fetches its checkpoint from the Hugging
+# Face hub on first use; the separator models land next to the code that loads
+# them. These are large and reproducible, so they stay out of the tree.
+*.ckpt
+*.safetensors
+models/
+checkpoints/
+
+# Secrets. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
