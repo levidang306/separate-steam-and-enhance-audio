@@ -1,0 +1,3 @@
+[submodule "vendor/Apollo"]
+	path = vendor/Apollo
+	url = https://github.com/JusperLee/Apollo

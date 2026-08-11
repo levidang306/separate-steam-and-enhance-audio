@@ -38,14 +38,20 @@ An output identical to its input means the step did nothing. An output whose
 ## Setup
 
 ```bash
+git submodule update --init      # Step 3: Apollo, pinned, no pip package
+
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt
 .venv/Scripts/pip install torch==2.7.1+cu118 torchaudio==2.7.1+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
-winget install Gyan.FFmpeg                                    # required by Step 2
-git clone https://github.com/JusperLee/Apollo vendor/Apollo   # Step 3, no pip package
+winget install Gyan.FFmpeg       # required by Step 2
 ```
+
+If you cloned without `--recurse-submodules`, that first line is what fills
+`vendor/Apollo`; skipping it leaves the directory empty and Step 3 fails with
+`ApolloUnavailable`. Apollo is pinned to a specific upstream revision rather
+than tracked at HEAD, so a plain `git clone` of it is not equivalent.
 
 The cu118 pin is deliberate. Plain `pip install torch` resolves to a CPU-only wheel, which drops
 every step onto the CPU — denoising one stem goes from under a minute to well over ten.
@@ -124,4 +130,6 @@ been disturbed), timing drift, and the per-band deltas.
 - Mastering (EQ, compression, loudness) is deliberately out of scope. Doing it per stem and then
   recombining stacks compression; it belongs in one pass on the finished mix.
 
-Design and measurements: [`docs/design/2026-08-09-suno-stem-restoration-design.md`](docs/design/2026-08-09-suno-stem-restoration-design.md)
+Design and measurements: [`docs/design/2026-08-10-merged-pipeline.md`](docs/design/2026-08-10-merged-pipeline.md),
+[`docs/audio-restoration-plan.md`](docs/audio-restoration-plan.md),
+[`docs/restoration-requirements.md`](docs/restoration-requirements.md)
